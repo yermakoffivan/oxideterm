@@ -5,7 +5,7 @@ use std::{
     collections::{HashMap, VecDeque},
     fs,
     io::Read,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, Mutex},
 };
 
@@ -15,9 +15,7 @@ use image::AnimationDecoder;
 use image::ImageDecoder;
 use image::ImageReader;
 use image::codecs::gif::GifDecoder;
-use tempfile::TempDir;
 use thiserror::Error;
-use uuid::Uuid;
 use zeroize::Zeroizing;
 
 // Protocol pieces stay in the crate root module to preserve the public API
@@ -26,5 +24,9 @@ include!("graphics/types.rs");
 include!("graphics/ingress.rs");
 include!("graphics/decode.rs");
 include!("graphics/parse.rs");
+include!("graphics/kitty.rs");
+include!("graphics/grid.rs");
+include!("graphics/relative.rs");
+include!("graphics/placeholders.rs");
 #[cfg(test)]
 include!("graphics/tests.rs");

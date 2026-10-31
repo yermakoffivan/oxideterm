@@ -19,14 +19,6 @@ fn parse_comma_params(data: &[u8]) -> HashMap<String, String> {
     split_params(data, b',')
 }
 
-fn parse_kitty_params_and_payload(data: &[u8]) -> Option<(HashMap<String, String>, &[u8])> {
-    let separator = data.iter().position(|byte| *byte == b';')?;
-    Some((
-        parse_comma_params(&data[..separator]),
-        &data[separator + 1..],
-    ))
-}
-
 fn parse_kitty_command(data: &[u8]) -> (HashMap<String, String>, Option<&[u8]>) {
     match data.iter().position(|byte| *byte == b';') {
         Some(separator) => (
@@ -35,10 +27,6 @@ fn parse_kitty_command(data: &[u8]) -> (HashMap<String, String>, Option<&[u8]>) 
         ),
         None => (parse_comma_params(data), None),
     }
-}
-
-fn kitty_query_response(id: u64) -> Vec<u8> {
-    format!("\x1b_Gi={id};OK\x1b\\").into_bytes()
 }
 
 fn split_params(data: &[u8], separator: u8) -> HashMap<String, String> {
@@ -88,4 +76,3 @@ fn advance_bytes(
     }
     bytes
 }
-

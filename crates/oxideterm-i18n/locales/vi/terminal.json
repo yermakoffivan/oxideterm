@@ -104,14 +104,14 @@
       "paste": "Dán"
     },
     "kitty_file_transmission": {
-      "title": "Cho phép Kitty truy cập tệp cục bộ trong phiên này?",
-      "description": "Yêu cầu đã bị chặn. Nếu cho phép, OxideTerm sẽ tạo thư mục riêng cho phiên và sao chép đường dẫn. Hãy thử lại quá trình truyền với tệp tty-graphics-protocol nằm trực tiếp trong thư mục đó.",
+      "title": "Cho phép tài nguyên cục bộ Kitty trong phiên này?",
+      "description": "Các chương trình trong cửa sổ dòng lệnh này, kể cả chương trình từ xa, sẽ có thể đọc tệp cục bộ và bộ nhớ chia sẻ để hiển thị ảnh. Chỉ cho phép các phiên đáng tin cậy. Quyền hết hiệu lực khi đóng hoặc kết nối lại. Sau khi cho phép, hãy thử lại việc truyền bị chặn.",
       "cancel": "Từ chối",
       "allow": "Cho phép trong phiên này",
       "allowed_title": "Đã cho phép Kitty truy cập tệp trong phiên này",
-      "allowed_description": "Thư mục truyền riêng đã được sao chép vào bảng tạm. Quyền này hết hiệu lực khi phiên terminal đóng.",
+      "allowed_description": "Tài nguyên ảnh cục bộ được cho phép cho đến khi đóng hoặc kết nối lại phiên này. Hãy thử truyền lại.",
       "failed_title": "Không thể bật quyền truy cập tệp cho Kitty",
-      "failed_description": "OxideTerm không thể tạo thư mục truyền riêng."
+      "failed_description": "OxideTerm không thể cấp quyền truy cập tài nguyên cục bộ cho phiên này."
     },
     "command_selection": {
       "actions": "Thao tác chọn lệnh",

@@ -831,7 +831,6 @@ struct TmuxPane {
     shell_integration: TerminalShellIntegration,
     graphics_ingress: GraphicsIngress,
     graphics: Arc<Mutex<TerminalGraphicsState>>,
-    graphics_alt_screen_active: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1406,6 +1405,9 @@ impl TmuxController {
                 }
             };
             let mut term = pane_state.term.lock();
+            pane_state
+                .graphics_ingress
+                .attach_grid(term.graphics_events());
             let cursor = Cell::new(graphics_cursor_from_term(&term, pane_size));
             let mut graphics = pane_state
                 .graphics
@@ -1414,7 +1416,6 @@ impl TmuxController {
             let parser = &mut pane_state.parser;
             let decoder = &mut pane_state.decoder;
             let shell_integration = &mut pane_state.shell_integration;
-            let graphics_alt_screen_active = &mut pane_state.graphics_alt_screen_active;
             let mut graphics_commands = Vec::new();
             pane_state.graphics_ingress.advance_ordered(
                 bytes,
@@ -1443,10 +1444,11 @@ impl TmuxController {
                                 },
                             );
                         }
-                        graphics.clear_for_alt_screen_transition(&term, graphics_alt_screen_active);
                         cursor.set(graphics_cursor_from_term(&term, pane_size));
                     }
                     TerminalGraphicsSegment::Event(event) => {
+                        crate::apply_graphics_terminal_event(&mut term, &event);
+                        cursor.set(graphics_cursor_from_term(&term, pane_size));
                         if let Some(response) = graphics.handle_event(event) {
                             graphics_commands.extend(pane_reply_commands(pane, &response));
                         }
@@ -1584,7 +1586,6 @@ impl TmuxController {
                 shell_integration: TerminalShellIntegration::default(),
                 graphics_ingress: GraphicsIngress::new(graphics_options),
                 graphics: Arc::new(Mutex::new(TerminalGraphicsState::default())),
-                graphics_alt_screen_active: false,
             }
         });
         let size = TerminalSize {
@@ -1596,6 +1597,13 @@ impl TmuxController {
         let mut term = pane_state.term.lock();
         if term.columns() != size.cols || term.screen_lines() != size.rows {
             term.resize(size);
+        }
+        for event in pane_state.graphics_ingress.synchronize_grid() {
+            pane_state
+                .graphics
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .handle_event(event);
         }
         drop(term);
         pane_state
@@ -1756,7 +1764,6 @@ impl TmuxController {
         pane_state.parser = Processor::new();
         pane_state.decoder.reset();
         pane_state.shell_integration = TerminalShellIntegration::default();
-        pane_state.graphics_alt_screen_active = false;
 
         let mut term = pane_state.term.lock();
         for (index, line) in lines.iter().enumerate() {

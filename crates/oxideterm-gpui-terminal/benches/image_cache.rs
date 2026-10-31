@@ -5,6 +5,8 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
+#[path = "../src/app/image_animation.rs"]
+mod image_animation;
 #[path = "../src/image_budget.rs"]
 mod image_budget;
 #[path = "../src/app/image_cache.rs"]
@@ -45,7 +47,7 @@ fn main() {
     use image_cache::ImageRenderCache;
     use oxideterm_terminal::*;
     use std::{sync::Arc, time::Instant};
-    println!("frames,sample,prepare_us,peak_bytes,retained_bytes");
+    println!("frames,sample,prepare_us,peak_bytes,retained_bytes,steady_1000_us,steady_peak_bytes");
     for count in [1, 48] {
         let pixels: Arc<[u8]> = vec![127; 512 * 256 * 4].into();
         let frames = if count == 1 {
@@ -75,6 +77,8 @@ fn main() {
             source_height: 256,
             z_index: 0,
             placeholder: true,
+            kitty: None,
+            clipped_rows: 0,
             version: 1,
             data: Some(Arc::new(TerminalImageData {
                 id: TerminalImageId(1),
@@ -84,7 +88,10 @@ fn main() {
                 height: 256,
                 rgba: frames.first().map_or(pixels, |frame| frame.rgba.clone()),
                 frames,
-                animation: TerminalImageAnimationState::default(),
+                animation: TerminalImageAnimationState {
+                    running: count > 1,
+                    ..Default::default()
+                },
                 name: None,
             })),
         };
@@ -106,12 +113,23 @@ fn main() {
                 rendered[0].render_image.as_ref().unwrap().frame_count(),
                 count
             );
-            if sample > 0 {
-                println!(
-                    "{count},{sample},{elapsed},{},{}",
-                    PEAK.load(Relaxed) - before,
-                    LIVE.load(Relaxed) - before
+            let peak = PEAK.load(Relaxed) - before;
+            let retained = LIVE.load(Relaxed) - before;
+            let steady_before = LIVE.load(Relaxed);
+            PEAK.store(steady_before, Relaxed);
+            let start = Instant::now();
+            for _ in 0..1000 {
+                assert!(
+                    cache
+                        .take_preparation_requests(std::slice::from_ref(&snapshot), true)
+                        .is_empty()
                 );
+                std::hint::black_box(cache.cached_images(std::slice::from_ref(&snapshot), true));
+            }
+            let steady = start.elapsed().as_micros();
+            let steady_peak = PEAK.load(Relaxed) - steady_before;
+            if sample > 0 {
+                println!("{count},{sample},{elapsed},{peak},{retained},{steady},{steady_peak}");
             }
             std::hint::black_box(rendered);
         }

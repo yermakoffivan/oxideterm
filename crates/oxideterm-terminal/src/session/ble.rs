@@ -67,7 +67,6 @@ pub struct BleSession {
     graphics_ingress: GraphicsIngress,
     graphics: TerminalGraphicsState,
     palette: TerminalPalette,
-    graphics_alt_screen_active: bool,
     output_queue: VecDeque<crate::backpressure::ByteBoundedItem<BleWorkerEvent>>,
     magic_scan: MagicScanWindow,
     encoding: TerminalEncoding,
@@ -189,7 +188,6 @@ impl BleSession {
             graphics_ingress: GraphicsIngress::new(graphics_options),
             graphics: TerminalGraphicsState::default(),
             palette: TerminalPalette::default(),
-            graphics_alt_screen_active: false,
             output_queue: VecDeque::new(),
             magic_scan: MagicScanWindow::default(),
             encoding,
@@ -383,6 +381,7 @@ impl BleSession {
             cell_width: self.resize.cell_width,
             cell_height: self.resize.cell_height,
         };
+        self.graphics_ingress.attach_grid(term.graphics_events());
         let cursor = Cell::new(graphics_cursor_from_term(&term, size));
         let mut protocol_responses = Vec::new();
         self.graphics_ingress.advance_ordered(
@@ -428,13 +427,11 @@ impl BleSession {
                             |event| self.pending_events.push(event),
                         );
                     }
-                    self.graphics.clear_for_alt_screen_transition(
-                        &term,
-                        &mut self.graphics_alt_screen_active,
-                    );
                     cursor.set(graphics_cursor_from_term(&term, size));
                 }
                 TerminalGraphicsSegment::Event(event) => {
+                    apply_graphics_terminal_event(&mut term, &event);
+                    cursor.set(graphics_cursor_from_term(&term, size));
                     if let Some(response) = self.graphics.handle_event(event) {
                         protocol_responses.push(response);
                     }
@@ -524,6 +521,9 @@ impl TerminalSessionBackend for BleSession {
             term.resize(size);
             self.shell_integration
                 .reflow_command_marks(&term, |event| self.pending_events.push(event));
+            for event in self.graphics_ingress.synchronize_grid() {
+                self.graphics.handle_event(event);
+            }
         }
         if grid_changed {
             if let Some(pending) = &mut self.recording_pending {

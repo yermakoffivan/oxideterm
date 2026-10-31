@@ -104,14 +104,14 @@
       "paste": "Incolla"
     },
     "kitty_file_transmission": {
-      "title": "Consentire a Kitty l’accesso ai file locali per questa sessione?",
-      "description": "La richiesta è stata bloccata. Se la consenti, OxideTerm crea una directory privata per la sessione e ne copia il percorso. Riprova il trasferimento con un file tty-graphics-protocol direttamente in quella directory.",
+      "title": "Consentire le risorse locali Kitty per questa sessione?",
+      "description": "I programmi di questo terminale, inclusi quelli remoti, potranno leggere file locali e memoria condivisa per mostrare immagini. Autorizza solo sessioni affidabili. Il permesso scade alla chiusura o alla riconnessione. Riprova quindi il trasferimento bloccato.",
       "cancel": "Nega",
       "allow": "Consenti per questa sessione",
       "allowed_title": "Accesso di Kitty consentito per questa sessione",
-      "allowed_description": "La directory privata di trasferimento è stata copiata negli appunti. L’autorizzazione termina alla chiusura di questa sessione del terminale.",
+      "allowed_description": "Le risorse immagine locali sono consentite fino alla chiusura o alla riconnessione di questa sessione. Riprova il trasferimento.",
       "failed_title": "Impossibile abilitare l’accesso di Kitty",
-      "failed_description": "OxideTerm non ha potuto creare la directory privata di trasferimento."
+      "failed_description": "OxideTerm non ha potuto autorizzare le risorse locali per questa sessione."
     },
     "command_selection": {
       "actions": "Azioni selezione comando",

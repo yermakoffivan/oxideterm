@@ -19,7 +19,6 @@ pub(super) struct SshParser {
     graphics_ingress: GraphicsIngress,
     pub(super) graphics: TerminalGraphicsState,
     pub(super) palette: TerminalPalette,
-    graphics_alt_screen_active: bool,
     magic_scan: MagicScanWindow,
     encoding: TerminalEncoding,
     utf8_guard: crate::backpressure::Utf8ResidualGuard,
@@ -107,7 +106,6 @@ impl SshParser {
                 graphics_ingress: GraphicsIngress::new(graphics_options),
                 graphics: TerminalGraphicsState::default(),
                 palette: TerminalPalette::default(),
-                graphics_alt_screen_active: false,
                 magic_scan: MagicScanWindow::default(),
                 encoding,
                 utf8_guard: Default::default(),
@@ -140,6 +138,7 @@ impl SshParser {
     }
 
     pub(super) fn retire_transport(&mut self) {
+        self.graphics_ingress.reset_stream();
         self.command_tx = None;
         self.shell_channel.take();
         self.transport_running = false;
@@ -165,7 +164,6 @@ impl SshParser {
         self.input_encoder = TerminalInputEncoder::new(self.encoding);
         self.magic_scan = MagicScanWindow::default();
         self.encoding_detector = EncodingMismatchDetector::new(self.encoding);
-        self.graphics_ingress.reset_stream();
         if let Some(controller) = &mut self.tmux_controller {
             controller.restart_transport();
         }
@@ -399,7 +397,6 @@ impl SshParser {
             Ok(outcome) => {
                 if outcome.entered {
                     self.graphics.clear();
-                    self.graphics_alt_screen_active = false;
                 }
                 self.queue_internal_tmux_commands(outcome.commands, outcome.replies);
                 if outcome.changed {
@@ -428,6 +425,7 @@ impl SshParser {
             cell_width: self.resize.cell_width,
             cell_height: self.resize.cell_height,
         };
+        self.graphics_ingress.attach_grid(term.graphics_events());
         let cursor = Cell::new(graphics_cursor_from_term(&term, size));
         let mut protocol_responses = Vec::new();
         self.graphics_ingress.advance_ordered(
@@ -481,13 +479,11 @@ impl SshParser {
                             |event| self.pending_events.push(event),
                         );
                     }
-                    self.graphics.clear_for_alt_screen_transition(
-                        &term,
-                        &mut self.graphics_alt_screen_active,
-                    );
                     cursor.set(graphics_cursor_from_term(&term, size));
                 }
                 TerminalGraphicsSegment::Event(event) => {
+                    apply_graphics_terminal_event(&mut term, &event);
+                    cursor.set(graphics_cursor_from_term(&term, size));
                     if let Some(response) = self.graphics.handle_event(event) {
                         protocol_responses.push(response);
                     }
@@ -1018,6 +1014,9 @@ impl SshParser {
             term.resize(size);
             self.shell_integration
                 .reflow_command_marks(&term, |event| self.pending_events.push(event));
+            for event in self.graphics_ingress.synchronize_grid() {
+                self.graphics.handle_event(event);
+            }
         }
         if grid_changed {
             if let Some(pending) = &self.recording_pending {

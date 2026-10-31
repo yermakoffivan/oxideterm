@@ -332,7 +332,7 @@ impl<T: GridCell + Default> Grid<T> {
         }
     }
 
-    pub fn clear_viewport<D>(&mut self)
+    pub fn clear_viewport<D>(&mut self) -> usize
     where
         T: ResetDiscriminant<D>,
         D: PartialEq,
@@ -356,6 +356,7 @@ impl<T: GridCell + Default> Grid<T> {
         for line in (0..(self.lines - positions)).map(Line::from) {
             self.raw[line].reset(&self.cursor.template);
         }
+        positions
     }
 
     /// Completely reset the grid state.

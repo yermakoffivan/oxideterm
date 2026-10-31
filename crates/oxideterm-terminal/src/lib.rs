@@ -1,11 +1,4 @@
-use std::{
-    borrow::Cow,
-    collections::{HashMap, VecDeque},
-    env,
-    path::PathBuf,
-    sync::Arc,
-    thread::JoinHandle,
-};
+use std::{borrow::Cow, collections::HashMap, env, path::PathBuf, sync::Arc, thread::JoinHandle};
 
 use alacritty_terminal::term::cell::Cell as AlacrittyCell;
 use alacritty_terminal::{
@@ -20,9 +13,7 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use oxideterm_modem_transfer::{ModemTransfer, ModemTransferRequest};
 use oxideterm_terminal_encoding::{EncodingHint, TerminalInputEncoder};
-use oxideterm_terminal_graphics::{
-    DEFAULT_STORAGE_LIMIT_MB, GraphicsCursor, TerminalGraphicsEvent, TerminalImagePlacement,
-};
+use oxideterm_terminal_graphics::{GraphicsCursor, TerminalGraphicsEvent, TerminalImagePlacement};
 
 mod activity;
 mod backpressure;

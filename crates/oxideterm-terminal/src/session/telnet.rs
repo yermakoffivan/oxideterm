@@ -45,7 +45,6 @@ pub struct TelnetSession {
     graphics_ingress: GraphicsIngress,
     graphics: TerminalGraphicsState,
     palette: TerminalPalette,
-    graphics_alt_screen_active: bool,
     output_queue: VecDeque<crate::backpressure::ByteBoundedItem<TelnetWorkerEvent>>,
     magic_scan: MagicScanWindow,
     encoding: TerminalEncoding,
@@ -180,11 +179,7 @@ impl TelnetCodec {
                         | TELNET_OPTION_TERMINAL_TYPE
                         | TELNET_OPTION_NAWS
                 ) {
-                    let mut responses = vec![vec![
-                        TELNET_COMMAND_IAC,
-                        TELNET_COMMAND_WILL,
-                        option,
-                    ]];
+                    let mut responses = vec![vec![TELNET_COMMAND_IAC, TELNET_COMMAND_WILL, option]];
                     if option == TELNET_OPTION_NAWS {
                         responses.push(self.naws_message());
                     }
@@ -311,7 +306,6 @@ impl TelnetSession {
             graphics_ingress: GraphicsIngress::new(graphics_options),
             graphics: TerminalGraphicsState::default(),
             palette: TerminalPalette::default(),
-            graphics_alt_screen_active: false,
             output_queue: VecDeque::new(),
             magic_scan: MagicScanWindow::default(),
             encoding,
@@ -512,6 +506,7 @@ impl TelnetSession {
             cell_width: self.resize.cell_width,
             cell_height: self.resize.cell_height,
         };
+        self.graphics_ingress.attach_grid(term.graphics_events());
         let cursor = Cell::new(graphics_cursor_from_term(&term, size));
         let mut protocol_responses = Vec::new();
         self.graphics_ingress.advance_ordered(
@@ -526,10 +521,10 @@ impl TelnetSession {
                     let decoded = if self.config.line_endings.output == SerialLineEnding::None {
                         decoded
                     } else {
-                        std::borrow::Cow::Owned(self.line_ending_ingress.normalize(
-                            decoded.as_ref(),
-                            self.config.line_endings.output,
-                        ))
+                        std::borrow::Cow::Owned(
+                            self.line_ending_ingress
+                                .normalize(decoded.as_ref(), self.config.line_endings.output),
+                        )
                     };
                     if let Some(stream) = self.trigger_stream.as_mut() {
                         stream.observe_bytes(decoded.as_ref(), |matched| {
@@ -566,11 +561,11 @@ impl TelnetSession {
                             |event| self.pending_events.push(event),
                         );
                     }
-                    self.graphics
-                        .clear_for_alt_screen_transition(&term, &mut self.graphics_alt_screen_active);
                     cursor.set(graphics_cursor_from_term(&term, size));
                 }
                 TerminalGraphicsSegment::Event(event) => {
+                    apply_graphics_terminal_event(&mut term, &event);
+                    cursor.set(graphics_cursor_from_term(&term, size));
                     if let Some(response) = self.graphics.handle_event(event) {
                         protocol_responses.push(response);
                     }
@@ -605,7 +600,9 @@ impl TelnetSession {
     fn handle_modem_consumer_events(&mut self, events: Vec<ModemConsumerEvent>) {
         for event in events {
             match event {
-                ModemConsumerEvent::WriteTerminal(bytes) => self.feed_plain_transport_output(&bytes),
+                ModemConsumerEvent::WriteTerminal(bytes) => {
+                    self.feed_plain_transport_output(&bytes)
+                }
                 ModemConsumerEvent::SendServer(bytes) => {
                     let _ = self.write_protocol_bytes(&bytes);
                 }
@@ -650,7 +647,8 @@ impl TelnetSession {
     fn push_output_event(&mut self, bytes: &[u8]) {
         if self.output_events_enabled && !bytes.is_empty() {
             // File consumers are opt-in, so keep this allocation off the normal rendering path.
-            self.pending_events.push(TerminalEvent::Output(bytes.to_vec()));
+            self.pending_events
+                .push(TerminalEvent::Output(bytes.to_vec()));
         }
     }
 
@@ -938,6 +936,9 @@ impl TerminalSessionBackend for TelnetSession {
             term.resize(size);
             self.shell_integration
                 .reflow_command_marks(&term, |event| self.pending_events.push(event));
+            for event in self.graphics_ingress.synchronize_grid() {
+                self.graphics.handle_event(event);
+            }
         }
         if grid_changed {
             if let Some(pending) = &mut self.recording_pending {
@@ -1072,11 +1073,7 @@ impl TerminalSessionBackend for TelnetSession {
         )
     }
 
-    fn snapshot_with_display_offset(
-        &self,
-        display_offset: usize,
-        rows: usize,
-    ) -> TerminalSnapshot {
+    fn snapshot_with_display_offset(&self, display_offset: usize, rows: usize) -> TerminalSnapshot {
         let term = self.term.lock();
         snapshot_from_term_with_display_offset(
             &term,
@@ -1174,7 +1171,10 @@ impl TelnetLoginAutomation {
             }
         }
 
-        let prompt = self.prompt_tail.strip_suffix(b" ").unwrap_or(&self.prompt_tail);
+        let prompt = self
+            .prompt_tail
+            .strip_suffix(b" ")
+            .unwrap_or(&self.prompt_tail);
         match self.stage {
             TelnetLoginStage::Username
                 if [b"login:".as_slice(), b"username:", b"user:"]
@@ -1914,8 +1914,9 @@ mod telnet_tests {
 
     #[test]
     fn terminal_output_processor_transforms_and_suppresses_parser_input() {
-        let transform: Option<TerminalOutputProcessor> =
-            Some(Arc::new(|bytes| bytes.iter().map(u8::to_ascii_uppercase).collect()));
+        let transform: Option<TerminalOutputProcessor> = Some(Arc::new(|bytes| {
+            bytes.iter().map(u8::to_ascii_uppercase).collect()
+        }));
         assert_eq!(
             apply_terminal_output_processor(&transform, b"prompt").as_ref(),
             b"PROMPT"

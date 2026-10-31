@@ -755,14 +755,14 @@ pub struct TerminalKittyFileTransmissionLabels {
 impl Default for TerminalKittyFileTransmissionLabels {
     fn default() -> Self {
         Self {
-            title: "Allow Kitty local-file access for this session?".to_string(),
-            description: "The request was blocked. If you allow it, OxideTerm creates a private session directory and copies its path. Retry the transfer using a tty-graphics-protocol file directly inside that directory.".to_string(),
+            title: "Allow Kitty local resources for this session?".to_string(),
+            description: "Programs in this terminal, including remote programs, will be able to read local files and shared memory for images. Only allow sessions you trust. Permission ends on close or reconnect; retry blocked transfers after allowing.".to_string(),
             cancel: "Deny".to_string(),
             allow: "Allow for this session".to_string(),
             allowed_title: "Kitty file access allowed for this session".to_string(),
-            allowed_description: "The private transfer directory was copied to the clipboard. The permission ends when this terminal session closes.".to_string(),
+            allowed_description: "Local image resources are allowed until this session closes or reconnects. Retry the transfer.".to_string(),
             failed_title: "Could not enable Kitty file access".to_string(),
-            failed_description: "OxideTerm could not create the private transfer directory.".to_string(),
+            failed_description: "OxideTerm could not authorize local resources for this session.".to_string(),
         }
     }
 }

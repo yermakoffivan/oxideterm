@@ -104,14 +104,14 @@
       "paste": "Einfügen"
     },
     "kitty_file_transmission": {
-      "title": "Kitty-Zugriff auf lokale Dateien für diese Sitzung erlauben?",
-      "description": "Die Anfrage wurde blockiert. Nach der Freigabe erstellt OxideTerm ein privates Sitzungsverzeichnis und kopiert dessen Pfad. Wiederholen Sie die Übertragung mit einer tty-graphics-protocol-Datei direkt in diesem Verzeichnis.",
+      "title": "Kitty-Zugriff auf lokale Ressourcen für diese Sitzung erlauben?",
+      "description": "Programme in diesem Terminal, auch auf entfernten Rechnern, können lokale Dateien und gemeinsamen Speicher für Bilder lesen. Erlauben Sie dies nur für vertrauenswürdige Sitzungen. Die Berechtigung endet beim Schließen oder erneuten Verbinden. Wiederholen Sie danach die blockierte Übertragung.",
       "cancel": "Ablehnen",
       "allow": "Für diese Sitzung erlauben",
       "allowed_title": "Kitty-Dateizugriff für diese Sitzung erlaubt",
-      "allowed_description": "Das private Übertragungsverzeichnis wurde in die Zwischenablage kopiert. Die Berechtigung endet mit dieser Terminalsitzung.",
+      "allowed_description": "Lokale Bildressourcen sind bis zum Schließen oder erneuten Verbinden dieser Sitzung erlaubt. Wiederholen Sie die Übertragung.",
       "failed_title": "Kitty-Dateizugriff konnte nicht aktiviert werden",
-      "failed_description": "OxideTerm konnte das private Übertragungsverzeichnis nicht erstellen."
+      "failed_description": "OxideTerm konnte den Zugriff auf lokale Ressourcen für diese Sitzung nicht erlauben."
     },
     "command_selection": {
       "actions": "Aktionen für Befehlsauswahl",

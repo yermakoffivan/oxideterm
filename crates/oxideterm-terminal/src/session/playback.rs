@@ -9,7 +9,6 @@ struct PlaybackTerminalSession {
     graphics_ingress: GraphicsIngress,
     graphics: TerminalGraphicsState,
     palette: TerminalPalette,
-    graphics_alt_screen_active: bool,
     shell_integration: TerminalShellIntegration,
     scrollback_lines: usize,
 }
@@ -44,7 +43,6 @@ impl PlaybackTerminalSession {
             graphics_ingress: GraphicsIngress::new(graphics_options),
             graphics: TerminalGraphicsState::default(),
             palette: TerminalPalette::default(),
-            graphics_alt_screen_active: false,
             shell_integration: TerminalShellIntegration::default(),
             scrollback_lines,
         }
@@ -61,7 +59,6 @@ impl PlaybackTerminalSession {
         self.parser = Processor::new();
         self.graphics_ingress = GraphicsIngress::new(self.graphics_options.clone());
         self.graphics = TerminalGraphicsState::default();
-        self.graphics_alt_screen_active = false;
         self.shell_integration = TerminalShellIntegration::default();
         self.pending_events.clear();
         while self.event_rx.try_recv().is_ok() {}
@@ -72,6 +69,7 @@ impl PlaybackTerminalSession {
             return;
         }
         let mut term = self.term.lock();
+        self.graphics_ingress.attach_grid(term.graphics_events());
         let cursor = Cell::new(graphics_cursor_from_term(&term, self.size));
         self.graphics_ingress.advance_ordered(
             bytes,
@@ -83,11 +81,11 @@ impl PlaybackTerminalSession {
                         &terminal_bytes,
                         |event| self.pending_events.push(event),
                     );
-                    self.graphics
-                        .clear_for_alt_screen_transition(&term, &mut self.graphics_alt_screen_active);
                     cursor.set(graphics_cursor_from_term(&term, self.size));
                 }
                 TerminalGraphicsSegment::Event(event) => {
+                    apply_graphics_terminal_event(&mut term, &event);
+                    cursor.set(graphics_cursor_from_term(&term, self.size));
                     if let Some(response) = self.graphics.handle_event(event) {
                         let _ = response;
                     }
@@ -121,7 +119,8 @@ impl PlaybackTerminalSession {
                     changed = true;
                 }
                 AlacEvent::ClipboardStore(_, text) => {
-                    self.pending_events.push(TerminalEvent::ClipboardStore(text));
+                    self.pending_events
+                        .push(TerminalEvent::ClipboardStore(text));
                 }
                 AlacEvent::ClipboardLoad(_format, callback) => {
                     self.pending_events
@@ -140,7 +139,6 @@ impl PlaybackTerminalSession {
         let term = self.term.lock();
         search_matches_from_term(&term, self.size.cols, query)
     }
-
 }
 
 #[cfg(test)]
@@ -149,7 +147,8 @@ mod recording_capture_tests {
 
     #[test]
     fn playback_renders_without_creating_a_live_audit_session() {
-        let mut playback = TerminalSession::recording_playback(20, 4, GraphicsOptions::default(), 100);
+        let mut playback =
+            TerminalSession::recording_playback(20, 4, GraphicsOptions::default(), 100);
         assert!(playback.audit_context().is_none());
         playback.feed_recording_output(b"replayed output");
         assert!(playback.buffer_text().contains("replayed output"));
@@ -258,6 +257,9 @@ impl TerminalSessionBackend for PlaybackTerminalSession {
             term.resize(next);
             self.shell_integration
                 .reflow_command_marks(&term, |event| self.pending_events.push(event));
+            for event in self.graphics_ingress.synchronize_grid() {
+                self.graphics.handle_event(event);
+            }
         }
         self.size = next;
         Ok(())
@@ -348,16 +350,25 @@ impl TerminalSessionBackend for PlaybackTerminalSession {
 
     fn snapshot_incremental(&self, previous: &TerminalSnapshot) -> TerminalSnapshot {
         let mut term = self.term.lock();
-        incremental_snapshot_from_term(&mut term, self.size, &self.graphics, &self.palette, previous)
+        incremental_snapshot_from_term(
+            &mut term,
+            self.size,
+            &self.graphics,
+            &self.palette,
+            previous,
+        )
     }
 
-    fn snapshot_with_display_offset(
-        &self,
-        display_offset: usize,
-        rows: usize,
-    ) -> TerminalSnapshot {
+    fn snapshot_with_display_offset(&self, display_offset: usize, rows: usize) -> TerminalSnapshot {
         let term = self.term.lock();
-        snapshot_from_term_with_display_offset(&term, self.size, &self.graphics, &self.palette, display_offset, rows)
+        snapshot_from_term_with_display_offset(
+            &term,
+            self.size,
+            &self.graphics,
+            &self.palette,
+            display_offset,
+            rows,
+        )
     }
 
     fn terminate_active_task(&mut self) -> Result<()> {

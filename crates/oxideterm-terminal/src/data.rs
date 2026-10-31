@@ -94,6 +94,8 @@ pub struct TerminalImageSnapshot {
     pub source_height: u32,
     pub z_index: i32,
     pub placeholder: bool,
+    pub kitty: Option<oxideterm_terminal_graphics::KittyPlacement>,
+    pub clipped_rows: usize,
     pub version: u64,
     pub data: Option<Arc<TerminalImageData>>,
 }

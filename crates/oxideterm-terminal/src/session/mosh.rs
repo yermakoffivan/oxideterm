@@ -34,7 +34,6 @@ pub struct MoshTerminalSession {
     graphics_ingress: GraphicsIngress,
     graphics: TerminalGraphicsState,
     palette: TerminalPalette,
-    graphics_alt_screen_active: bool,
     output_queue: VecDeque<crate::backpressure::ByteBoundedItem<MoshTerminalWorkerEvent>>,
     output_processor: Option<TerminalOutputProcessor>,
     output_events_enabled: bool,
@@ -46,10 +45,7 @@ pub struct MoshTerminalSession {
 }
 
 enum MoshTerminalCommand {
-    Data {
-        prediction_id: u64,
-        bytes: Vec<u8>,
-    },
+    Data { prediction_id: u64, bytes: Vec<u8> },
     Resize { columns: u16, rows: u16 },
     Close,
 }
@@ -109,8 +105,7 @@ impl MoshTerminalSession {
             crate::backpressure::TRANSPORT_OUTPUT_BACKLOG_BYTES,
             listener.activity_sender(),
         );
-        let (command_tx, command_rx) =
-            tokio::sync::mpsc::channel(MOSH_COMMAND_CHANNEL_CAPACITY);
+        let (command_tx, command_rx) = tokio::sync::mpsc::channel(MOSH_COMMAND_CHANNEL_CAPACITY);
         let term = Arc::new(FairMutex::new(Term::new(
             interactive_terminal_config(scrollback_lines),
             &size,
@@ -171,7 +166,6 @@ impl MoshTerminalSession {
             graphics_ingress: GraphicsIngress::new(graphics_options),
             graphics: TerminalGraphicsState::default(),
             palette: TerminalPalette::default(),
-            graphics_alt_screen_active: false,
             output_queue: VecDeque::new(),
             output_processor: None,
             output_events_enabled: false,
@@ -387,6 +381,7 @@ impl MoshTerminalSession {
             cell_width: self.resize.cell_width,
             cell_height: self.resize.cell_height,
         };
+        self.graphics_ingress.attach_grid(term.graphics_events());
         let cursor = Cell::new(graphics_cursor_from_term(&term, size));
         let mut protocol_responses = Vec::new();
         self.graphics_ingress.advance_ordered(
@@ -427,11 +422,11 @@ impl MoshTerminalSession {
                             |event| self.pending_events.push(event),
                         );
                     }
-                    self.graphics
-                        .clear_for_alt_screen_transition(&term, &mut self.graphics_alt_screen_active);
                     cursor.set(graphics_cursor_from_term(&term, size));
                 }
                 TerminalGraphicsSegment::Event(event) => {
+                    apply_graphics_terminal_event(&mut term, &event);
+                    cursor.set(graphics_cursor_from_term(&term, size));
                     if let Some(response) = self.graphics.handle_event(event) {
                         protocol_responses.push(response);
                     }
@@ -483,7 +478,10 @@ impl MoshTerminalSession {
             PredictionReconciliation::Local(bytes) => self.feed_prediction_overlay(&bytes),
             PredictionReconciliation::Redraw => {
                 // Every displayed OxideTerm prediction is anchored with a cursor context.
-                debug_assert!(false, "contextual Mosh prediction unexpectedly required redraw");
+                debug_assert!(
+                    false,
+                    "contextual Mosh prediction unexpectedly required redraw"
+                );
             }
         }
     }
@@ -541,11 +539,13 @@ impl MoshTerminalSession {
                 false
             }
             AlacEvent::ClipboardStore(_, text) => {
-                self.pending_events.push(TerminalEvent::ClipboardStore(text));
+                self.pending_events
+                    .push(TerminalEvent::ClipboardStore(text));
                 false
             }
             AlacEvent::ClipboardLoad(_, formatter) => {
-                self.pending_events.push(TerminalEvent::ClipboardLoad(formatter));
+                self.pending_events
+                    .push(TerminalEvent::ClipboardLoad(formatter));
                 false
             }
             AlacEvent::ColorSchemeRequest => {
@@ -630,12 +630,20 @@ impl TerminalSessionBackend for MoshTerminalSession {
     }
 
     fn write_text(&mut self, text: &str) -> Result<()> {
-        self.queue_user_input(text.as_bytes(), prediction_action_from_input(text.as_bytes()))
+        self.queue_user_input(
+            text.as_bytes(),
+            prediction_action_from_input(text.as_bytes()),
+        )
     }
 
     fn paste_text(&mut self, text: &str) -> Result<()> {
         let bytes = if self.mode().contains(TermMode::BRACKETED_PASTE) {
-            [b"\x1b[200~".as_slice(), text.as_bytes(), b"\x1b[201~".as_slice()].concat()
+            [
+                b"\x1b[200~".as_slice(),
+                text.as_bytes(),
+                b"\x1b[201~".as_slice(),
+            ]
+            .concat()
         } else {
             text.as_bytes().to_vec()
         };
@@ -705,6 +713,9 @@ impl TerminalSessionBackend for MoshTerminalSession {
             });
             self.shell_integration
                 .reflow_command_marks(&term, |event| self.pending_events.push(event));
+            for event in self.graphics_ingress.synchronize_grid() {
+                self.graphics.handle_event(event);
+            }
         }
         if grid_changed {
             if let Some(pending) = &mut self.recording_pending {
@@ -745,10 +756,18 @@ impl TerminalSessionBackend for MoshTerminalSession {
         )
     }
 
-    fn page_up(&mut self) { self.term.lock().scroll_display(Scroll::PageUp); }
-    fn page_down(&mut self) { self.term.lock().scroll_display(Scroll::PageDown); }
-    fn scroll_to_top(&mut self) { self.term.lock().scroll_display(Scroll::Top); }
-    fn scroll_to_bottom(&mut self) { self.term.lock().scroll_display(Scroll::Bottom); }
+    fn page_up(&mut self) {
+        self.term.lock().scroll_display(Scroll::PageUp);
+    }
+    fn page_down(&mut self) {
+        self.term.lock().scroll_display(Scroll::PageDown);
+    }
+    fn scroll_to_top(&mut self) {
+        self.term.lock().scroll_display(Scroll::Top);
+    }
+    fn scroll_to_bottom(&mut self) {
+        self.term.lock().scroll_display(Scroll::Bottom);
+    }
 
     fn scroll_to_display_offset(&mut self, offset: usize) {
         let mut term = self.term.lock();
@@ -765,7 +784,10 @@ impl TerminalSessionBackend for MoshTerminalSession {
     }
 
     fn search_source(&self) -> Option<crate::TerminalSearchSource> {
-        Some(crate::TerminalSearchSource::new(self.term.clone(), self.resize.cols))
+        Some(crate::TerminalSearchSource::new(
+            self.term.clone(),
+            self.resize.cols,
+        ))
     }
 
     fn set_selection(&self, selection: Option<crate::TerminalSelectionRange>) {
@@ -834,14 +856,20 @@ impl TerminalSessionBackend for MoshTerminalSession {
         )
     }
 
-    fn terminate_active_task(&mut self) -> Result<()> { self.write_protocol_bytes(b"\x03") }
-    fn kill_active_task(&mut self) -> Result<()> { self.write_protocol_bytes(b"\x03") }
+    fn terminate_active_task(&mut self) -> Result<()> {
+        self.write_protocol_bytes(b"\x03")
+    }
+    fn kill_active_task(&mut self) -> Result<()> {
+        self.write_protocol_bytes(b"\x03")
+    }
 
     fn shutdown(&mut self) {
         if matches!(self.lifecycle, TerminalLifecycle::Closed) {
             return;
         }
-        if let Some(cancellation) = self.startup_cancellation.take() { cancellation.cancel(); }
+        if let Some(cancellation) = self.startup_cancellation.take() {
+            cancellation.cancel();
+        }
         if let Some(sink) = &self.recording_sink {
             sink.interrupt();
         }

@@ -113,7 +113,7 @@ enum ImageFrameData {
         width: u32,
         crop: crate::Bounds<u32>,
         delay: Delay,
-        decoded: std::sync::OnceLock<Vec<u8>>,
+        decoded: std::sync::OnceLock<Arc<Vec<u8>>>,
     },
     Pixels(Frame),
     Compact {
@@ -163,6 +163,16 @@ impl RenderImage {
         dimensions: Size<u32>,
         crop: crate::Bounds<u32>,
     ) -> Option<Self> {
+        Self::from_rgba_frames_reusing(frames, dimensions, crop, None)
+    }
+
+    /// Reuses converted protocol frames when a command changes only part of an animation.
+    pub fn from_rgba_frames_reusing(
+        frames: impl IntoIterator<Item = (Arc<[u8]>, Delay)>,
+        dimensions: Size<u32>,
+        crop: crate::Bounds<u32>,
+        previous: Option<&Self>,
+    ) -> Option<Self> {
         if crop.size.width == 0
             || crop.size.height == 0
             || crop.origin.x.checked_add(crop.size.width)? > dimensions.width
@@ -173,41 +183,54 @@ impl RenderImage {
         let bytes = (dimensions.width as usize)
             .checked_mul(dimensions.height as usize)?
             .checked_mul(4)?;
+        let mut converted = std::collections::HashMap::new();
+        if let Some(previous) = previous {
+            for frame in &previous.data {
+                if let ImageFrameData::Rgba {
+                    pixels,
+                    width,
+                    crop: old_crop,
+                    decoded,
+                    ..
+                } = frame
+                    && *width == dimensions.width
+                    && *old_crop == crop
+                    && let Some(decoded) = decoded.get()
+                {
+                    converted.insert(pixels.as_ptr(), decoded);
+                }
+            }
+        }
         let mut image = Self::new(SmallVec::<[Frame; 1]>::new());
         for (pixels, delay) in frames {
             if pixels.len() != bytes {
                 return None;
+            }
+            let decoded = std::sync::OnceLock::new();
+            if let Some(converted) = converted.get(&pixels.as_ptr()) {
+                let _ = decoded.set(Arc::clone(converted));
             }
             image.data.push(ImageFrameData::Rgba {
                 pixels,
                 width: dimensions.width,
                 crop,
                 delay,
-                decoded: Default::default(),
+                decoded,
             });
         }
         if image.frame_count() > 1 {
-            image.data = image
-                .data
-                .into_iter()
-                .map(|frame| {
-                    let ImageFrameData::Rgba {
-                        pixels,
-                        width,
-                        crop,
-                        delay,
-                        ..
-                    } = frame
-                    else {
-                        unreachable!();
-                    };
-                    let pixels = rgba_frame_pixels(&pixels, width, crop);
-                    let buffer =
-                        image::RgbaImage::from_raw(crop.size.width, crop.size.height, pixels)
-                            .expect("validated RGBA crop dimensions");
-                    ImageFrameData::Pixels(Frame::from_parts(buffer, 0, 0, delay))
-                })
-                .collect();
+            for frame in &image.data {
+                if let ImageFrameData::Rgba {
+                    pixels,
+                    width,
+                    crop,
+                    decoded,
+                    ..
+                } = frame
+                {
+                    decoded.get_or_init(|| Arc::new(rgba_frame_pixels(pixels, *width, *crop)));
+                }
+            }
         }
         Some(image)
     }
@@ -285,7 +308,7 @@ impl RenderImage {
             .map(|frame| match frame {
                 ImageFrameData::Rgba {
                     pixels, decoded, ..
-                } => pixels.len() + decoded.get().map_or(0, Vec::capacity),
+                } => pixels.len() + decoded.get().map_or(0, |pixels| pixels.capacity()),
                 ImageFrameData::Pixels(frame) => frame.buffer().as_raw().capacity(),
                 ImageFrameData::Compact { bytes, decoded, .. } => {
                     bytes.capacity() + decoded.get().map_or(0, Vec::capacity)
@@ -341,7 +364,7 @@ impl RenderImage {
                 decoded,
                 ..
             } => decoded
-                .get_or_init(|| rgba_frame_pixels(pixels, *width, *crop))
+                .get_or_init(|| Arc::new(rgba_frame_pixels(pixels, *width, *crop)))
                 .as_slice(),
             ImageFrameData::Pixels(frame) => frame.buffer().as_raw().as_slice(),
             ImageFrameData::Compact { bytes, decoded, .. } => decoded
@@ -463,6 +486,40 @@ mod tests {
                 crate::Bounds::new(crate::point(1, 0), size(2, 1)),
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn protocol_animation_edits_share_unchanged_converted_frames() {
+        let red: Arc<[u8]> = vec![255, 0, 0, 255].into();
+        let green: Arc<[u8]> = vec![0, 255, 0, 255].into();
+        let blue: Arc<[u8]> = vec![0, 0, 255, 255].into();
+        let delay = Delay::from_numer_denom_ms(40, 1);
+        let crop = crate::Bounds::new(crate::point(0, 0), size(1, 1));
+        let first =
+            RenderImage::from_rgba_frames([(red.clone(), delay), (green, delay)], size(1, 1), crop)
+                .unwrap();
+        let next = RenderImage::from_rgba_frames_reusing(
+            [(red, delay), (blue, delay)],
+            size(1, 1),
+            crop,
+            Some(&first),
+        )
+        .unwrap();
+        assert_eq!(next.as_bytes(0), Some([0, 0, 255, 255].as_slice()));
+        assert_eq!(next.as_bytes(1), Some([255, 0, 0, 255].as_slice()));
+        assert_eq!(
+            first.as_bytes(0).unwrap().as_ptr(),
+            next.as_bytes(0).unwrap().as_ptr()
+        );
+        assert_ne!(
+            first.as_bytes(1).unwrap().as_ptr(),
+            next.as_bytes(1).unwrap().as_ptr()
+        );
+        drop(first);
+        assert_eq!(
+            next.frame_bytes(0).unwrap().unwrap().as_ref(),
+            &[0, 0, 255, 255]
         );
     }
 

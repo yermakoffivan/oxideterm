@@ -48,6 +48,14 @@ Common pane patterns:
 
 Use the terminal context menu and command bar for explicit pane actions such as copy, paste, search, command selection, and terminal-native file transfers. Background images and terminal image placements are visual/rendering state; if a full-screen TUI leaves stale image content behind, clear or reopen the pane rather than editing saved connection data.
 
+### Images in terminals
+
+Kitty image transfers that read local files or shared memory require permission for each terminal session. You can grant it in the terminal context menu before starting a previewer, or use the prompt shown after a blocked request. After allowing access, retry the transfer; rejected requests are not replayed.
+
+Grant permission only to sessions you trust: programs running in that terminal, including remote programs and programs inside tmux, can request local image resources. The permission is not saved and ends when the session closes or reconnects. Declining suppresses further automatic prompts; you can open the context-menu action to allow access later.
+
+Direct image transfers do not need this permission. Image memory remains budgeted, and repeated placements share their pixels. Images represented by Unicode placeholders move with the underlying text, including in scrollback.
+
 ### Command Folding and Shell Integration
 
 Open **Settings → Terminal → Display** and enable **Command folding**. Click the button beside a completed command in the left gutter to collapse or expand its output. The command's context menu also offers **Collapse output** or **Expand output**; enable **Hover Actions** if you want those controls beside a selected command.

@@ -8,6 +8,7 @@ use gpui::RenderImage;
 use image::Delay;
 use oxideterm_terminal::{TerminalImageId, TerminalImageSnapshot};
 
+use super::image_animation::{ImageClock, ImagePlayback};
 use crate::image_budget::{release_image_bytes, try_reserve_image_bytes};
 
 const DEFAULT_RENDER_IMAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
@@ -17,14 +18,14 @@ const IMAGE_PREPARATION_RETRY_DELAY: std::time::Duration = std::time::Duration::
 pub(crate) struct TerminalRenderedImage {
     pub(crate) snapshot: TerminalImageSnapshot,
     pub(crate) render_image: Option<Arc<RenderImage>>,
-    pub(crate) animation_started_at: Option<Instant>,
+    pub(crate) playback: ImagePlayback,
 }
 
 pub(crate) struct ImageRenderCache {
     entries: HashMap<ImageCacheKey, CachedRenderImage>,
     pending: HashSet<ImageCacheKey>,
     desired: HashSet<ImageCacheKey>,
-    suspended_clocks: HashMap<ImageCacheKey, Instant>,
+    clocks: HashMap<TerminalImageId, ImageClock>,
     retry_after: HashMap<ImageCacheKey, Instant>,
     retired_images: Vec<Arc<RenderImage>>,
     bytes: usize,
@@ -45,9 +46,14 @@ struct ImageCacheKey {
 struct CachedRenderImage {
     image: Arc<RenderImage>,
     bytes: usize,
-    animation_started_at: Option<Instant>,
     last_used: u64,
     source: Arc<oxideterm_terminal::TerminalImageData>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ImagePreparation {
+    snapshot: TerminalImageSnapshot,
+    previous: Option<Arc<RenderImage>>,
 }
 
 pub(crate) struct PreparedRenderImage {
@@ -71,7 +77,7 @@ impl Default for ImageRenderCache {
             entries: HashMap::new(),
             pending: HashSet::new(),
             desired: HashSet::new(),
-            suspended_clocks: HashMap::new(),
+            clocks: HashMap::new(),
             retry_after: HashMap::new(),
             retired_images: Vec::new(),
             bytes: 0,
@@ -83,11 +89,11 @@ impl Default for ImageRenderCache {
 
 impl ImageRenderCache {
     pub(crate) fn suspend(&mut self) -> Vec<Arc<RenderImage>> {
-        self.suspended_clocks.clear();
-        for (key, entry) in self.entries.drain() {
-            if let Some(started) = entry.animation_started_at {
-                self.suspended_clocks.insert(key, started);
-            }
+        let now = Instant::now();
+        for clock in self.clocks.values_mut() {
+            clock.suspend(now);
+        }
+        for (_, entry) in self.entries.drain() {
             self.retired_images.push(entry.image);
         }
         self.bytes = 0;
@@ -111,22 +117,31 @@ impl ImageRenderCache {
         images: &[TerminalImageSnapshot],
         decode_images: bool,
     ) -> Vec<TerminalRenderedImage> {
+        let now = Instant::now();
         images
             .iter()
             .cloned()
             .map(|snapshot| {
-                let (render_image, animation_started_at) = if decode_images {
-                    match self.cached_image_for_snapshot(&snapshot) {
-                        Some((image, animation_started_at)) => (Some(image), animation_started_at),
-                        None => (None, None),
-                    }
+                let render_image = if decode_images {
+                    self.cached_image_for_snapshot(&snapshot)
                 } else {
-                    (None, None)
+                    None
+                };
+                let playback = if decode_images && let Some(source) = &snapshot.data {
+                    let clock = self
+                        .clocks
+                        .entry(snapshot.id)
+                        .or_insert_with(|| ImageClock::new(source.clone(), now));
+                    clock.update(source.clone(), now);
+                    clock.resume(now);
+                    clock.sample(now)
+                } else {
+                    ImagePlayback::default()
                 };
                 TerminalRenderedImage {
                     snapshot,
                     render_image,
-                    animation_started_at,
+                    playback,
                 }
             })
             .collect()
@@ -136,21 +151,39 @@ impl ImageRenderCache {
         &mut self,
         images: &[TerminalImageSnapshot],
         decode_images: bool,
-    ) -> Vec<TerminalImageSnapshot> {
+    ) -> Vec<ImagePreparation> {
         self.desired = if decode_images {
             images.iter().map(ImageCacheKey::from_snapshot).collect()
         } else {
             HashSet::new()
         };
         self.retry_after.retain(|key, _| self.desired.contains(key));
+        let clock_ids = self
+            .desired
+            .iter()
+            .chain(self.entries.keys())
+            .map(|key| key.id)
+            .collect::<HashSet<_>>();
+        self.clocks.retain(|id, _| clock_ids.contains(id));
         if !decode_images {
             return Vec::new();
         }
         let mut requests = Vec::new();
         for snapshot in images.iter().filter(|snapshot| snapshot.data.is_some()) {
             let key = ImageCacheKey::from_snapshot(snapshot);
+            if self.entries.contains_key(&key) || self.pending.contains(&key) {
+                continue;
+            }
+            let previous = self.entries.iter().find_map(|(old, entry)| {
+                (old.id == key.id
+                    && old.source_x == key.source_x
+                    && old.source_y == key.source_y
+                    && old.source_width == key.source_width
+                    && old.source_height == key.source_height)
+                    .then(|| entry.image.clone())
+            });
             // Animation controls revise the snapshot without changing its pixels.
-            // Reuse the uploaded frames, but keep the existing restart-clock semantics.
+            // Reuse pixels independently of the per-image playback clock.
             if !self.entries.contains_key(&key) {
                 let reusable = self.entries.iter().find_map(|(old_key, entry)| {
                     (old_key.id == key.id
@@ -164,7 +197,6 @@ impl ImageRenderCache {
                 if let Some(old_key) = reusable {
                     let mut entry = self.entries.remove(&old_key).unwrap();
                     entry.source = snapshot.data.as_ref().unwrap().clone();
-                    entry.animation_started_at = (entry.image.frame_count() > 1).then(Instant::now);
                     self.entries.insert(key, entry);
                 }
                 // A newer revision supersedes every crop of the older image.
@@ -190,12 +222,16 @@ impl ImageRenderCache {
             }
             self.retry_after.remove(&key);
             self.pending.insert(key);
-            requests.push(snapshot.clone());
+            requests.push(ImagePreparation {
+                snapshot: snapshot.clone(),
+                previous,
+            });
         }
         requests
     }
 
-    pub(crate) fn prepare_snapshot(snapshot: TerminalImageSnapshot) -> Option<PreparedRenderImage> {
+    pub(crate) fn prepare_snapshot(request: ImagePreparation) -> Option<PreparedRenderImage> {
+        let snapshot = request.snapshot;
         let key = ImageCacheKey::from_snapshot(&snapshot);
         let source = snapshot.data.as_ref()?.clone();
         let upload_bytes = (snapshot.source_width as usize)
@@ -208,7 +244,8 @@ impl ImageRenderCache {
             return None;
         }
         let reservation = ImageUploadReservation(upload_bytes);
-        let image = render_image_for_snapshot(&source, &snapshot)?.retaining(reservation);
+        let image = render_image_for_snapshot(&source, &snapshot, request.previous.as_deref())?
+            .retaining(reservation);
         let bytes = if source.frames.is_empty() {
             source.rgba.len()
         } else {
@@ -224,15 +261,15 @@ impl ImageRenderCache {
 
     pub(crate) fn finish_preparations(
         &mut self,
-        requested: &[TerminalImageSnapshot],
+        requested: &[ImagePreparation],
         prepared: Vec<PreparedRenderImage>,
     ) {
         let prepared_keys = prepared
             .iter()
             .map(|prepared| prepared.key)
             .collect::<HashSet<_>>();
-        for snapshot in requested {
-            let key = ImageCacheKey::from_snapshot(snapshot);
+        for request in requested {
+            let key = ImageCacheKey::from_snapshot(&request.snapshot);
             self.pending.remove(&key);
             if self.desired.contains(&key) && !prepared_keys.contains(&key) {
                 self.retry_after
@@ -247,17 +284,11 @@ impl ImageRenderCache {
             self.retry_after.remove(&prepared.key);
             self.usage_clock = self.usage_clock.wrapping_add(1);
             let render_image = prepared.image;
-            let animation_started_at = (render_image.frame_count() > 1).then(|| {
-                self.suspended_clocks
-                    .remove(&prepared.key)
-                    .unwrap_or_else(Instant::now)
-            });
             self.entries.insert(
                 prepared.key,
                 CachedRenderImage {
                     image: render_image,
                     bytes: prepared.bytes,
-                    animation_started_at,
                     last_used: self.usage_clock,
                     source: prepared.source,
                 },
@@ -270,13 +301,13 @@ impl ImageRenderCache {
     fn cached_image_for_snapshot(
         &mut self,
         snapshot: &TerminalImageSnapshot,
-    ) -> Option<(Arc<RenderImage>, Option<Instant>)> {
+    ) -> Option<Arc<RenderImage>> {
         let key = ImageCacheKey::from_snapshot(snapshot);
         self.usage_clock = self.usage_clock.wrapping_add(1);
         if let Some(cached) = self.entries.get_mut(&key) {
             // Cache hits remain O(1); eviction scans only when admitting new pixel data.
             cached.last_used = self.usage_clock;
-            return Some((cached.image.clone(), cached.animation_started_at));
+            return Some(cached.image.clone());
         }
 
         None
@@ -347,11 +378,11 @@ fn same_render_frames(
         && left.height == right.height
         && Arc::ptr_eq(&left.rgba, &right.rgba)
         && left.frames.len() == right.frames.len()
-        && left.frames.iter().zip(&right.frames).all(|(left, right)| {
-            Arc::ptr_eq(&left.rgba, &right.rgba)
-                && left.delay_ms_numerator == right.delay_ms_numerator
-                && left.delay_ms_denominator == right.delay_ms_denominator
-        })
+        && left
+            .frames
+            .iter()
+            .zip(&right.frames)
+            .all(|(left, right)| Arc::ptr_eq(&left.rgba, &right.rgba))
 }
 
 impl ImageCacheKey {
@@ -370,6 +401,7 @@ impl ImageCacheKey {
 fn render_image_for_snapshot(
     data: &oxideterm_terminal::TerminalImageData,
     snapshot: &TerminalImageSnapshot,
+    previous: Option<&RenderImage>,
 ) -> Option<RenderImage> {
     let dimensions = gpui::size(data.width, data.height);
     let crop = gpui::Bounds::new(
@@ -377,13 +409,14 @@ fn render_image_for_snapshot(
         gpui::size(snapshot.source_width, snapshot.source_height),
     );
     if data.frames.is_empty() {
-        RenderImage::from_rgba_frames(
+        RenderImage::from_rgba_frames_reusing(
             [(data.rgba.clone(), Delay::from_numer_denom_ms(0, 1))],
             dimensions,
             crop,
+            previous,
         )
     } else {
-        RenderImage::from_rgba_frames(
+        RenderImage::from_rgba_frames_reusing(
             data.frames.iter().map(|frame| {
                 (
                     frame.rgba.clone(),
@@ -395,6 +428,7 @@ fn render_image_for_snapshot(
             }),
             dimensions,
             crop,
+            previous,
         )
     }
 }
@@ -426,6 +460,8 @@ mod tests {
             source_height: 1,
             z_index: 0,
             placeholder: true,
+            kitty: None,
+            clipped_rows: 0,
             version: 1,
             data: Some(Arc::new(TerminalImageData {
                 id: TerminalImageId(10),
@@ -464,6 +500,8 @@ mod tests {
             source_height: 1,
             z_index: 0,
             placeholder: true,
+            kitty: None,
+            clipped_rows: 0,
             version: 1,
             data: Some(Arc::new(TerminalImageData {
                 id: TerminalImageId(12),
@@ -491,6 +529,7 @@ mod tests {
                     loading: false,
                     current_frame: 0,
                     loop_limit: None,
+                    ..Default::default()
                 },
                 name: None,
             })),
@@ -504,7 +543,7 @@ mod tests {
         assert_eq!(image.delay(1).numer_denom_ms(), (75, 1));
         assert_eq!(image.as_bytes(0), Some([0, 0, 255, 255].as_slice()));
         assert_eq!(image.as_bytes(1), Some([0, 255, 0, 255].as_slice()));
-        assert!(rendered[0].animation_started_at.is_some());
+        assert!(rendered[0].playback.next.is_some());
 
         snapshot.version = 2;
         let data = Arc::make_mut(snapshot.data.as_mut().unwrap());
@@ -521,14 +560,14 @@ mod tests {
                 .animation
                 .running
         );
-        let clock = controlled[0].animation_started_at;
+        let playback = controlled[0].playback;
         let retired = cache.suspend();
         assert_eq!(
             retired.iter().map(|image| image.id).collect::<Vec<_>>(),
             [image.id]
         );
         let restored = cache.render_images(std::slice::from_ref(&snapshot), true);
-        assert_eq!(restored[0].animation_started_at, clock);
+        assert_eq!(restored[0].playback, playback);
         assert_eq!(
             restored[0].render_image.as_ref().unwrap().as_bytes(1),
             Some([0, 255, 0, 255].as_slice())
@@ -574,6 +613,8 @@ mod tests {
             source_height: 1,
             z_index: 0,
             placeholder: true,
+            kitty: None,
+            clipped_rows: 0,
             version: 1,
             data: Some(Arc::new(TerminalImageData {
                 id: TerminalImageId(11),

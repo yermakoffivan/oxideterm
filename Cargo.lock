@@ -8205,15 +8205,17 @@ dependencies = [
 name = "oxideterm-terminal-graphics"
 version = "2.2.6"
 dependencies = [
+ "alacritty_terminal",
  "anyhow",
  "base64 0.22.1",
  "criterion 0.5.1",
+ "flate2",
  "icy_sixel",
  "image",
+ "libc",
  "memchr",
  "tempfile",
  "thiserror 2.0.20",
- "uuid",
  "zeroize",
 ]
 

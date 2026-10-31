@@ -42,11 +42,11 @@ use crate::{
     TerminalActivityReceiver, TerminalCommandMark, TerminalCwdIntegrationLaunchState,
     TerminalEvent, TerminalGraphicsState, TerminalLifecycle, TerminalModemTransferRequest,
     TerminalPalette, TerminalProcessInfo, TerminalProcessProbe, TerminalSearchMatch, TerminalSize,
-    TerminalSnapshot, append_grid_line_text, backpressure::MagicScanWindow, focus_report_sequence,
-    graphics_cursor_from_term, incremental_snapshot_from_term, interactive_terminal_config,
-    local_event_channel, privilege_prompt::TerminalPrivilegePromptStream,
-    scroll_snapshot_from_term, search_matches_from_term,
-    shell_integration::TerminalShellIntegration, snapshot_from_term,
+    TerminalSnapshot, append_grid_line_text, apply_graphics_terminal_event,
+    backpressure::MagicScanWindow, focus_report_sequence, graphics_cursor_from_term,
+    incremental_snapshot_from_term, interactive_terminal_config, local_event_channel,
+    privilege_prompt::TerminalPrivilegePromptStream, scroll_snapshot_from_term,
+    search_matches_from_term, shell_integration::TerminalShellIntegration, snapshot_from_term,
     snapshot_from_term_with_display_offset,
 };
 

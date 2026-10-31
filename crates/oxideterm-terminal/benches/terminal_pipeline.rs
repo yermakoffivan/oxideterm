@@ -215,6 +215,18 @@ fn benchmark_terminal_pipeline(criterion: &mut Criterion) {
     });
     throughput.finish();
 
+    let mut resize_terminal = populated_terminal(20_000);
+    let mut narrow = false;
+    criterion.bench_function("terminal_resize_20000_lines", |bencher| {
+        bencher.iter(|| {
+            narrow = !narrow;
+            resize_terminal
+                .resize_with_cell_size(if narrow { 80 } else { 120 }, 40, 10, 20)
+                .unwrap();
+            black_box(&resize_terminal);
+        });
+    });
+
     let terminal = populated_terminal(20_000);
     let previous_snapshot = terminal.snapshot();
     criterion.bench_function("snapshot_120x40", |bencher| {

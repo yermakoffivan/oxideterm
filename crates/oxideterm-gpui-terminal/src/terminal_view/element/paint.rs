@@ -1,10 +1,8 @@
-use std::time::Duration;
-
 use gpui::{
-    App, Bounds, Corners, DecorationRun, Hsla, PathBuilder, Pixels, Point, RenderImage, Rgba,
-    SharedString, TextAlign, TextRun, Window, fill, point, px, rgb, rgba, size,
+    App, Bounds, Corners, DecorationRun, Hsla, PathBuilder, Pixels, Point, Rgba, SharedString,
+    TextAlign, TextRun, Window, fill, point, px, rgb, rgba, size,
 };
-use oxideterm_terminal::{TerminalCursorShape, TerminalImageData};
+use oxideterm_terminal::TerminalCursorShape;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -311,11 +309,14 @@ pub(crate) fn paint_terminal_image(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let bounds = Bounds::new(
+    let mut bounds = Bounds::new(
         origin
             + point(
                 px(image.image.snapshot.col as f32 * metrics.cell_width_f32()),
-                px(image.image.snapshot.row as f32 * metrics.line_height_f32()),
+                px(
+                    (image.image.snapshot.row as f32 - image.image.snapshot.clipped_rows as f32)
+                        * metrics.line_height_f32(),
+                ),
             ),
         size(
             px(image.image.snapshot.cols as f32 * metrics.cell_width_f32()),
@@ -323,168 +324,98 @@ pub(crate) fn paint_terminal_image(
         ),
     );
 
+    let mut clip = bounds;
+    if let Some(kitty) = &image.image.snapshot.kitty {
+        if let Some(region) = &kitty.unicode {
+            clip.size = size(
+                px(region.cols as f32 * metrics.cell_width_f32()),
+                px(metrics.line_height_f32()),
+            );
+            bounds.origin.x -= px(region.col as f32 * metrics.cell_width_f32());
+            bounds.origin.y -= px(region.row as f32 * metrics.line_height_f32());
+        }
+        bounds.origin.x += px(kitty.column_offset as f32 * metrics.cell_width_f32());
+        bounds = kitty_image_bounds(
+            bounds,
+            size(
+                image.image.snapshot.source_width,
+                image.image.snapshot.source_height,
+            ),
+            point(kitty.offset_x, kitty.offset_y),
+            kitty.scaled,
+        );
+        if kitty.unicode.is_none() {
+            clip.origin.y += px(kitty.clip_top as f32 * metrics.line_height_f32());
+            clip.size.height = px((image
+                .image
+                .snapshot
+                .rows
+                .saturating_sub(kitty.clip_top + kitty.clip_bottom))
+                as f32
+                * metrics.line_height_f32());
+        }
+    }
     let Some(render_image) = &image.image.render_image else {
         window.paint_quad(fill(bounds, rgba(0x528bff29)));
         return;
     };
-    let data = image.image.snapshot.data.as_deref();
-    let (frame_index, next_frame) = terminal_image_playback(
-        render_image,
-        data,
-        image
-            .image
-            .animation_started_at
-            .map(|start| start.elapsed()),
-    );
+    let frame_index = image.image.playback.frame;
+    let next_frame = image.image.playback.next;
     if let Some(delay) = next_frame.filter(|_| window.is_window_active()) {
         window.request_animation_frame_after(delay, cx);
     }
-    let _ = window.paint_image(
-        bounds,
-        bounds,
-        Corners::all(px(0.0)),
-        render_image.clone(),
-        frame_index,
-        false,
-    );
+    window.with_content_mask(Some(gpui::ContentMask { bounds: clip }), |window| {
+        let _ = window.paint_image(
+            bounds,
+            bounds,
+            Corners::all(px(0.0)),
+            render_image.clone(),
+            frame_index,
+            false,
+        );
+    });
 }
 
-fn terminal_image_playback(
-    render_image: &RenderImage,
-    data: Option<&TerminalImageData>,
-    elapsed: Option<Duration>,
-) -> (usize, Option<Duration>) {
-    let frame_count = render_image.frame_count();
-    if frame_count <= 1 {
-        return (0, None);
+fn kitty_image_bounds(
+    mut cells: Bounds<Pixels>,
+    source: gpui::Size<u32>,
+    offset: Point<u32>,
+    scaled: bool,
+) -> Bounds<Pixels> {
+    cells.origin.x += px(offset.x as f32);
+    cells.origin.y += px(offset.y as f32);
+    if scaled {
+        cells.size.width = (cells.size.width - px(offset.x as f32)).max(px(0.0));
+        cells.size.height = (cells.size.height - px(offset.y as f32)).max(px(0.0));
+        let ratio = (f32::from(cells.size.width) / source.width.max(1) as f32)
+            .min(f32::from(cells.size.height) / source.height.max(1) as f32);
+        let fitted = size(
+            px(source.width as f32 * ratio),
+            px(source.height as f32 * ratio),
+        );
+        cells.origin.x += (cells.size.width - fitted.width) / 2.0;
+        cells.origin.y += (cells.size.height - fitted.height) / 2.0;
+        cells.size = fitted;
+    } else {
+        cells.size = size(px(source.width as f32), px(source.height as f32));
     }
-    let Some(data) = data else { return (0, None) };
-    let current = data.animation.current_frame.min(frame_count - 1);
-    let Some(elapsed) = elapsed.filter(|_| data.animation.running) else {
-        return (current, None);
-    };
-    let delay = |index: usize| {
-        if data.frames.get(index).is_some_and(|frame| frame.gapless) {
-            Duration::ZERO
-        } else {
-            Duration::from(render_image.delay(index))
-        }
-    };
-    let cycle: Duration = (0..frame_count).map(delay).sum();
-    if cycle.is_zero() {
-        return (current, None);
-    }
-    let last = || {
-        (0..frame_count)
-            .rev()
-            .find(|index| !delay(*index).is_zero())
-            .unwrap_or(frame_count - 1)
-    };
-    if (0..frame_count)
-        .filter(|index| !delay(*index).is_zero())
-        .take(2)
-        .count()
-        == 1
-    {
-        return (last(), None);
-    }
-    if (data.animation.loading && elapsed >= cycle)
-        || data
-            .animation
-            .loop_limit
-            .is_some_and(|limit| elapsed.as_nanos() >= cycle.as_nanos() * u128::from(limit))
-    {
-        return (last(), None);
-    }
-    let position = elapsed.as_nanos() % cycle.as_nanos();
-    let mut end = 0;
-    for index in 0..frame_count {
-        end += delay(index).as_nanos();
-        if position < end {
-            // One frame's delay is bounded by the protocol's u32 millisecond value.
-            return (index, Some(Duration::from_nanos((end - position) as u64)));
-        }
-    }
-    (last(), None)
+    cells
 }
 
 #[cfg(test)]
-mod animation_tests {
+mod image_geometry_tests {
     use super::*;
-    use oxideterm_terminal::{TerminalImageAnimationState, TerminalImageId, TerminalImageProtocol};
 
     #[test]
-    fn frame_deadlines_preserve_pause_loading_and_finite_loops() {
-        let image = RenderImage::new(vec![
-            image::Frame::from_parts(
-                image::RgbaImage::new(1, 1),
-                0,
-                0,
-                image::Delay::from_numer_denom_ms(100, 1),
-            ),
-            image::Frame::from_parts(
-                image::RgbaImage::new(1, 1),
-                0,
-                0,
-                image::Delay::from_numer_denom_ms(200, 1),
-            ),
-        ]);
-        let mut data = TerminalImageData {
-            id: TerminalImageId(1),
-            protocol: TerminalImageProtocol::Kitty,
-            version: 1,
-            width: 1,
-            height: 1,
-            rgba: vec![0; 4].into(),
-            frames: Vec::new(),
-            name: None,
-            animation: TerminalImageAnimationState {
-                running: true,
-                ..Default::default()
-            },
-        };
-        for (elapsed, frame, remaining) in [
-            (0, 0, 100),
-            (99, 0, 1),
-            (100, 1, 200),
-            (299, 1, 1),
-            (300, 0, 100),
-        ] {
-            assert_eq!(
-                terminal_image_playback(&image, Some(&data), Some(Duration::from_millis(elapsed))),
-                (frame, Some(Duration::from_millis(remaining)))
-            );
-        }
-        data.animation.loop_limit = Some(2);
+    fn native_pixels_and_explicit_cell_boxes_have_distinct_sizes() {
+        let cells = Bounds::new(point(px(20.0), px(40.0)), size(px(20.0), px(40.0)));
         assert_eq!(
-            terminal_image_playback(&image, Some(&data), Some(Duration::from_millis(600))),
-            (1, None)
+            kitty_image_bounds(cells, size(8, 4), point(2, 4), false),
+            Bounds::new(point(px(22.0), px(44.0)), size(px(8.0), px(4.0)))
         );
-        data.animation.loading = true;
         assert_eq!(
-            terminal_image_playback(&image, Some(&data), Some(Duration::from_millis(300))),
-            (1, None)
-        );
-        data.animation.running = false;
-        data.animation.current_frame = 1;
-        assert_eq!(
-            terminal_image_playback(&image, Some(&data), Some(Duration::ZERO)),
-            (1, None)
-        );
-        data.animation.running = true;
-        data.animation.loading = false;
-        data.animation.loop_limit = None;
-        data.frames = (0..2)
-            .map(|index| oxideterm_terminal::TerminalImageFrame {
-                rgba: vec![0; 4].into(),
-                delay_ms_numerator: 100,
-                delay_ms_denominator: 1,
-                gapless: index == 0,
-            })
-            .collect();
-        assert_eq!(
-            terminal_image_playback(&image, Some(&data), Some(Duration::ZERO)),
-            (1, None)
+            kitty_image_bounds(cells, size(8, 4), point(2, 4), true),
+            Bounds::new(point(px(22.0), px(57.5)), size(px(18.0), px(9.0)))
         );
     }
 }

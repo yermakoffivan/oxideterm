@@ -846,7 +846,17 @@ impl TerminalElement {
             .cloned()
             .map(|image| TerminalImageLayout { image })
             .collect::<Vec<_>>();
-        images.sort_by_key(|image| (image.image.snapshot.z_index, image.image.snapshot.id.0));
+        images.sort_by_key(|image| {
+            (
+                image.image.snapshot.z_index,
+                image
+                    .image
+                    .snapshot
+                    .kitty
+                    .as_ref()
+                    .map_or(image.image.snapshot.id.0, |k| u64::from(k.image_id)),
+            )
+        });
         let mut text_runs = Vec::new();
         let mut timestamp_runs = Vec::new();
         let mut cached_rows = Vec::new();
@@ -1179,6 +1189,12 @@ impl TerminalElement {
                 continue;
             }
 
+            if cell.ch == '\u{10eeee}' {
+                if let Some(run) = current_run.take() {
+                    text_runs.push(run);
+                }
+                continue;
+            }
             if cell.ch != ' '
                 || !cell.zerowidth().is_empty()
                 || (self.grid_cursor_visible() && cell.cursor)
@@ -1998,7 +2014,7 @@ fn push_visual_text_runs(
         let Some(cell) = row.cells.get(cluster.logical_col) else {
             continue;
         };
-        if cell.ch == ' ' && cell.zerowidth().is_empty() {
+        if (cell.ch == ' ' && cell.zerowidth().is_empty()) || cell.ch == '\u{10eeee}' {
             if let Some(run) = current_run.take() {
                 text_runs.push(run);
             }
@@ -2267,6 +2283,13 @@ impl Element for TerminalElement {
                 bounds: grid_mask_bounds,
             }),
             |window| {
+                for image in layout
+                    .images
+                    .iter()
+                    .filter(|image| image.image.snapshot.z_index < -1_073_741_824)
+                {
+                    paint_terminal_image(image, origin, &self.metrics, window, cx);
+                }
                 for rect in &layout.backgrounds {
                     paint_terminal_rect(rect, origin, &self.metrics, window);
                 }
@@ -2287,7 +2310,7 @@ impl Element for TerminalElement {
                 for image in layout
                     .images
                     .iter()
-                    .filter(|image| image.image.snapshot.z_index < 0)
+                    .filter(|image| (-1_073_741_824..0).contains(&image.image.snapshot.z_index))
                 {
                     paint_terminal_image(image, origin, &self.metrics, window, cx);
                 }

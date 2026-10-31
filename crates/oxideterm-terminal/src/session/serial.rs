@@ -173,7 +173,6 @@ pub struct SerialSession {
     graphics_ingress: GraphicsIngress,
     graphics: TerminalGraphicsState,
     palette: TerminalPalette,
-    graphics_alt_screen_active: bool,
     output_queue: VecDeque<crate::backpressure::ByteBoundedItem<SerialWorkerEvent>>,
     magic_scan: MagicScanWindow,
     encoding: TerminalEncoding,
@@ -379,7 +378,6 @@ impl SerialSession {
             graphics_ingress: GraphicsIngress::new(serial_graphics_options),
             graphics: TerminalGraphicsState::default(),
             palette: TerminalPalette::default(),
-            graphics_alt_screen_active: false,
             output_queue: VecDeque::new(),
             magic_scan: MagicScanWindow::default(),
             encoding,
@@ -585,6 +583,7 @@ impl SerialSession {
             cell_width: self.resize.cell_width,
             cell_height: self.resize.cell_height,
         };
+        self.graphics_ingress.attach_grid(term.graphics_events());
         let cursor = Cell::new(graphics_cursor_from_term(&term, size));
         let mut protocol_responses = Vec::new();
         self.graphics_ingress.advance_ordered(
@@ -633,11 +632,11 @@ impl SerialSession {
                             |event| self.pending_events.push(event),
                         );
                     }
-                    self.graphics
-                        .clear_for_alt_screen_transition(&term, &mut self.graphics_alt_screen_active);
                     cursor.set(graphics_cursor_from_term(&term, size));
                 }
                 TerminalGraphicsSegment::Event(event) => {
+                    apply_graphics_terminal_event(&mut term, &event);
+                    cursor.set(graphics_cursor_from_term(&term, size));
                     if let Some(response) = self.graphics.handle_event(event) {
                         protocol_responses.push(response);
                     }
@@ -650,7 +649,6 @@ impl SerialSession {
             let _ = self.write_protocol_bytes(&response);
         }
     }
-
 }
 
 impl Drop for SerialSession {
@@ -732,6 +730,9 @@ impl TerminalSessionBackend for SerialSession {
             term.resize(size);
             self.shell_integration
                 .reflow_command_marks(&term, |event| self.pending_events.push(event));
+            for event in self.graphics_ingress.synchronize_grid() {
+                self.graphics.handle_event(event);
+            }
         }
         if grid_changed {
             if let Some(pending) = &mut self.recording_pending {
@@ -981,7 +982,10 @@ fn open_serial_port(
 fn map_serial_port_info(port: serialport::SerialPortInfo) -> SerialPortInfo {
     match port.port_type {
         serialport::SerialPortType::UsbPort(info) => SerialPortInfo {
-            display_name: info.product.clone().unwrap_or_else(|| port.port_name.clone()),
+            display_name: info
+                .product
+                .clone()
+                .unwrap_or_else(|| port.port_name.clone()),
             port_path: port.port_name,
             port_type: "usb".to_string(),
             manufacturer: info.manufacturer,
@@ -990,7 +994,9 @@ fn map_serial_port_info(port: serialport::SerialPortInfo) -> SerialPortInfo {
             vid: Some(info.vid),
             pid: Some(info.pid),
         },
-        serialport::SerialPortType::BluetoothPort => serial_port_info_without_usb(port, "bluetooth"),
+        serialport::SerialPortType::BluetoothPort => {
+            serial_port_info_without_usb(port, "bluetooth")
+        }
         serialport::SerialPortType::PciPort => serial_port_info_without_usb(port, "pci"),
         serialport::SerialPortType::Unknown => serial_port_info_without_usb(port, "unknown"),
     }
@@ -1061,8 +1067,9 @@ fn reserve_serial_port(port_path: &str) -> Result<SerialPortReservation, SerialE
 }
 
 fn serial_port_owners() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
-    static OWNERS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
-        std::sync::OnceLock::new();
+    static OWNERS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, String>>,
+    > = std::sync::OnceLock::new();
     OWNERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -1224,7 +1231,11 @@ pub(crate) fn parse_serial_hex_input(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(parsed)
 }
 
-pub(crate) fn format_serial_hexdump(bytes: &[u8], offset: &mut u64, include_ascii: bool) -> Vec<u8> {
+pub(crate) fn format_serial_hexdump(
+    bytes: &[u8],
+    offset: &mut u64,
+    include_ascii: bool,
+) -> Vec<u8> {
     use std::fmt::Write as _;
 
     if bytes.is_empty() {
@@ -1402,7 +1413,6 @@ mod serial_tests {
             graphics_ingress: GraphicsIngress::new(GraphicsOptions::default()),
             graphics: TerminalGraphicsState::default(),
             palette: TerminalPalette::default(),
-            graphics_alt_screen_active: false,
             output_queue: VecDeque::new(),
             magic_scan: MagicScanWindow::default(),
             encoding: TerminalEncoding::Utf8,
@@ -1539,14 +1549,18 @@ mod serial_tests {
     #[ignore = "timed serial parsing and snapshot probe"]
     fn serial_frequent_output_ui_cadence_probe() {
         let frame_ms = std::env::var("OXIDE_SERIAL_PROBE_FRAME_MS")
-            .unwrap_or_else(|_| "0".into()).parse::<u64>().unwrap();
+            .unwrap_or_else(|_| "0".into())
+            .parse::<u64>()
+            .unwrap();
         let mut session = test_serial_session();
         session.output_events_enabled = true;
         let (sender, receiver) = crate::backpressure::byte_bounded_channel(
             crate::backpressure::TRANSPORT_OUTPUT_BACKLOG_BYTES,
         );
         session.worker_rx = receiver;
-        let packets = (0..200).map(|index| format!("serial packet {index:04}: abcdef0123456789\r\n").into_bytes()).collect::<Vec<_>>();
+        let packets = (0..200)
+            .map(|index| format!("serial packet {index:04}: abcdef0123456789\r\n").into_bytes())
+            .collect::<Vec<_>>();
         let expected = packets.concat();
         let producer = std::thread::spawn(move || {
             let start = Instant::now();
@@ -1573,16 +1587,21 @@ mod serial_tests {
         let mut parse_time = Duration::ZERO;
         let mut snapshot_time = Duration::ZERO;
         while drained < expected.len() && start.elapsed() < Duration::from_secs(10) {
-            if session.worker_rx.is_empty() || last_tick.elapsed() < Duration::from_millis(frame_ms) {
+            if session.worker_rx.is_empty() || last_tick.elapsed() < Duration::from_millis(frame_ms)
+            {
                 std::thread::sleep(Duration::from_millis(1));
                 continue;
             }
             last_tick = Instant::now();
-            let report = session.read_pending_with_budget(TerminalDrainBudget::normal().with_max_duration(Duration::from_millis(2)));
+            let report = session.read_pending_with_budget(
+                TerminalDrainBudget::normal().with_max_duration(Duration::from_millis(2)),
+            );
             parse_time += last_tick.elapsed();
             drained += report.drained_bytes;
             for event in session.take_events() {
-                if let TerminalEvent::Output(bytes) = event { output.extend(bytes); }
+                if let TerminalEvent::Output(bytes) = event {
+                    output.extend(bytes);
+                }
             }
             if report.changed {
                 ticks += 1;
@@ -1820,9 +1839,8 @@ mod serial_tests {
     #[test]
     fn fake_serial_worker_lifecycle_closes_without_reading_after_close_command() {
         let config = valid_config();
-        let mut port = FakeSerialPort::new(VecDeque::from([FakeRead::Bytes(
-            b"unexpected".to_vec(),
-        )]));
+        let mut port =
+            FakeSerialPort::new(VecDeque::from([FakeRead::Bytes(b"unexpected".to_vec())]));
         let (command_tx, command_rx) = crossbeam_channel::unbounded();
         let (worker_tx, worker_rx) = crate::backpressure::byte_bounded_channel(
             crate::backpressure::TRANSPORT_OUTPUT_BACKLOG_BYTES,
@@ -1864,7 +1882,10 @@ mod serial_tests {
         });
         let deadline = Instant::now() + Duration::from_secs(3);
         while !reads.lock().unwrap().is_empty() {
-            assert!(Instant::now() < deadline, "serial worker did not read its pending output");
+            assert!(
+                Instant::now() < deadline,
+                "serial worker did not read its pending output"
+            );
             std::thread::sleep(Duration::from_millis(1));
         }
         command_tx
@@ -2067,5 +2088,4 @@ mod serial_tests {
             Color::Named(NamedColor::Foreground)
         );
     }
-
 }

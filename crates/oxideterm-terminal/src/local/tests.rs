@@ -29,19 +29,33 @@ mod tests {
             if direct_reply {
                 listener.protocol_tx = Some(protocol_tx);
             }
-            let size = TerminalSize { cols: 80, rows: 24, cell_width: 0, cell_height: 0 };
+            let size = TerminalSize {
+                cols: 80,
+                rows: 24,
+                cell_width: 0,
+                cell_height: 0,
+            };
             let mut term = Term::new(Config::default(), &size, listener);
             let mut parser = Processor::<StdSyncHandler>::new();
             parser.advance(&mut term, b"\x1b[12;7H\x1b[6n");
             if direct_reply {
                 assert_eq!(protocol_rx.try_recv().unwrap(), "\x1b[12;7R");
-                assert!(!events.rx.try_iter().any(|event| matches!(event, AlacEvent::PtyWrite(_))));
+                assert!(
+                    !events
+                        .rx
+                        .try_iter()
+                        .any(|event| matches!(event, AlacEvent::PtyWrite(_)))
+                );
             } else {
                 // tmux pane owners still receive their replies for pane-specific routing.
-                let replies = events.rx.try_iter().filter_map(|event| match event {
-                    AlacEvent::PtyWrite(text) => Some(text),
-                    _ => None,
-                }).collect::<Vec<_>>();
+                let replies = events
+                    .rx
+                    .try_iter()
+                    .filter_map(|event| match event {
+                        AlacEvent::PtyWrite(text) => Some(text),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
                 assert_eq!(replies, ["\x1b[12;7R"]);
             }
         }
@@ -246,11 +260,7 @@ mod tests {
             AuditContext, AuditPolicy, AuditService, AuditSource, AuditStore, RecordingState,
             StoredRecordingFrameKind,
         };
-        use std::sync::{
-            Arc, Mutex,
-            atomic::AtomicBool,
-            mpsc,
-        };
+        use std::sync::{Arc, Mutex, atomic::AtomicBool, mpsc};
         use std::time::{Duration, Instant};
 
         let corpus = (0..600_000)
@@ -718,7 +728,11 @@ mod tests {
             .expect("grid resize should succeed");
         assert!(session.take_events().iter().any(|event| matches!(
             event,
-            TerminalEvent::CommandMark(TerminalCommandMarkEvent::Reflowed { cols: 100, rows: 24, .. })
+            TerminalEvent::CommandMark(TerminalCommandMarkEvent::Reflowed {
+                cols: 100,
+                rows: 24,
+                ..
+            })
         )));
     }
 
@@ -786,55 +800,42 @@ mod tests {
     }
 
     #[test]
-    fn graphics_state_evicts_images_and_placements_over_budget() {
-        let mut graphics = TerminalGraphicsState {
-            storage_limit_bytes: 4,
-            ..TerminalGraphicsState::default()
-        };
-
-        graphics.handle_event(TerminalGraphicsEvent::ImageReady(TerminalImageData {
-            id: TerminalImageId(1),
-            protocol: TerminalImageProtocol::Kitty,
-            version: 0,
-            width: 1,
-            height: 1,
-            rgba: vec![0, 0, 0, 255].into(),
-            frames: Vec::new(),
-            animation: TerminalImageAnimationState::default(),
-            name: None,
-        }));
-        graphics.handle_event(TerminalGraphicsEvent::Place(TerminalImagePlacement {
-            id: TerminalImageId(1),
-            protocol: TerminalImageProtocol::Kitty,
+    fn graphics_budget_eviction_releases_snapshot_pixels_and_placements() {
+        let mut graphics = TerminalGraphicsState::default();
+        let mut ingress = GraphicsIngress::new(GraphicsOptions {
+            storage_limit_mb: 1,
+            ..GraphicsOptions::default()
+        });
+        let cursor = GraphicsCursor {
             line: 0,
             row: 0,
             col: 0,
-            cols: 1,
-            rows: 1,
-            pixel_width: 1,
-            pixel_height: 1,
-            source_x: 0,
-            source_y: 0,
-            source_width: 1,
-            source_height: 1,
-            z_index: 0,
-            placeholder: true,
-        }));
-        graphics.handle_event(TerminalGraphicsEvent::ImageReady(TerminalImageData {
-            id: TerminalImageId(2),
-            protocol: TerminalImageProtocol::Kitty,
-            version: 0,
-            width: 1,
-            height: 1,
-            rgba: vec![255, 255, 255, 255].into(),
-            frames: Vec::new(),
-            animation: TerminalImageAnimationState::default(),
-            name: None,
-        }));
-
-        assert!(!graphics.images.contains_key(&TerminalImageId(1)));
-        assert!(graphics.images.contains_key(&TerminalImageId(2)));
-        assert!(graphics.placements.is_empty());
+            cols: 80,
+            rows: 24,
+            cell_width: 10,
+            cell_height: 20,
+        };
+        let mut previous = None;
+        for id in 1..=2 {
+            let payload = format!("{}AA==", "AAAA".repeat((512 * 512 * 4) / 3));
+            let bytes = format!("\x1b_Ga=T,i={id},f=32,s=512,v=512,C=1,q=2;{payload}\x1b\\");
+            for event in ingress.advance(bytes.as_bytes(), cursor).events {
+                graphics.handle_event(event);
+            }
+            if id == 1 {
+                previous = Some(Arc::downgrade(&graphics.images[&TerminalImageId(1)].rgba));
+            }
+        }
+        assert!(previous.unwrap().upgrade().is_none());
+        assert_eq!(
+            graphics
+                .visible_images(0, 24)
+                .iter()
+                .map(|i| i.id.0)
+                .collect::<Vec<_>>(),
+            [2]
+        );
+        assert_eq!(graphics.images[&TerminalImageId(2)].rgba[0], 0);
     }
 
     #[test]
@@ -866,6 +867,8 @@ mod tests {
             source_height: 1,
             z_index: 0,
             placeholder: true,
+            kitty: None,
+            alternate_screen: false,
         };
         for (event, expected_placements) in [
             (TerminalGraphicsEvent::ImageReady(image([255; 4])), vec![]),
@@ -879,7 +882,10 @@ mod tests {
             graphics.handle_event(TerminalGraphicsEvent::Place(placement.clone()));
             graphics.handle_event(event);
 
-            assert_eq!(graphics.images[&TerminalImageId(7)].rgba.as_ref(), &[255; 4]);
+            assert_eq!(
+                graphics.images[&TerminalImageId(7)].rgba.as_ref(),
+                &[255; 4]
+            );
             assert_eq!(graphics.placements, expected_placements);
         }
     }
@@ -948,6 +954,8 @@ mod tests {
             source_height: 1,
             z_index: 0,
             placeholder: false,
+            kitty: None,
+            alternate_screen: false,
         }));
 
         let first = snapshot_from_term(&term, size, &graphics, &TerminalPalette::default());
@@ -1060,6 +1068,386 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn kitty_multiple_placements_share_pixels_and_delete_independently() {
+        let size = TerminalSize {
+            cols: 20,
+            rows: 10,
+            cell_width: 10,
+            cell_height: 20,
+        };
+        let term = std::cell::RefCell::new(Term::new(Config::default(), &size, VoidListener));
+        let mut parser = Processor::<StdSyncHandler>::new();
+        let mut ingress = GraphicsIngress::new(GraphicsOptions::default());
+        let mut graphics = TerminalGraphicsState::default();
+        let bytes = b"\x1b_Ga=t,i=42,f=32,s=1,v=1,q=2;/wAA/w==\x1b\\\x1b[2;3H\x1b_Ga=p,i=42,p=1,C=1,q=2\x1b\\\x1b[5;6H\x1b_Ga=p,i=42,p=2,C=1,q=2\x1b\\";
+        for chunk in bytes.chunks(3) {
+            ingress.advance_ordered(
+                chunk,
+                |segment| match segment {
+                    TerminalGraphicsSegment::Terminal(bytes) => {
+                        parser.advance(&mut *term.borrow_mut(), &bytes)
+                    }
+                    TerminalGraphicsSegment::Event(event) => {
+                        graphics.handle_event(event);
+                    }
+                },
+                || graphics_cursor_from_term(&term.borrow(), size),
+            );
+        }
+        let snapshot =
+            snapshot_from_term(&term.borrow(), size, &graphics, &TerminalPalette::default());
+        assert_eq!(
+            snapshot
+                .images
+                .iter()
+                .map(|image| (image.row, image.col))
+                .collect::<Vec<_>>(),
+            [(1, 2), (4, 5)]
+        );
+        assert_eq!(
+            snapshot.images[0].data.as_ref().unwrap().rgba.as_ref(),
+            &[255, 0, 0, 255]
+        );
+        assert!(Arc::ptr_eq(
+            snapshot.images[0].data.as_ref().unwrap(),
+            snapshot.images[1].data.as_ref().unwrap()
+        ));
+        for event in ingress
+            .advance(
+                b"\x1b_Ga=d,d=i,i=42,p=1,q=2\x1b\\",
+                graphics_cursor_from_term(&term.borrow(), size),
+            )
+            .events
+        {
+            graphics.handle_event(event);
+        }
+        let snapshot =
+            snapshot_from_term(&term.borrow(), size, &graphics, &TerminalPalette::default());
+        assert_eq!(
+            snapshot
+                .images
+                .iter()
+                .map(|image| (image.row, image.col))
+                .collect::<Vec<_>>(),
+            [(4, 5)]
+        );
+        assert_eq!(term.borrow().grid().cursor.point.column.0, 5);
+    }
+
+    fn feed_kitty_grid(
+        ingress: &mut GraphicsIngress,
+        term: &std::cell::RefCell<Term<VoidListener>>,
+        parser: &mut Processor<StdSyncHandler>,
+        graphics: &mut TerminalGraphicsState,
+        bytes: &[u8],
+        size: TerminalSize,
+    ) {
+        ingress.attach_grid(term.borrow_mut().graphics_events());
+        ingress.advance_ordered(
+            bytes,
+            |segment| match segment {
+                TerminalGraphicsSegment::Terminal(bytes) => {
+                    parser.advance(&mut *term.borrow_mut(), &bytes)
+                }
+                TerminalGraphicsSegment::Event(event) => {
+                    apply_graphics_terminal_event(&mut *term.borrow_mut(), &event);
+                    graphics.handle_event(event);
+                }
+            },
+            || graphics_cursor_from_term(&term.borrow(), size),
+        );
+    }
+
+    #[test]
+    fn kitty_grid_changes_preserve_text_screens_scroll_and_reflow() {
+        let mut size = TerminalSize {
+            cols: 12,
+            rows: 6,
+            cell_width: 10,
+            cell_height: 20,
+        };
+        let term = std::cell::RefCell::new(Term::new(Config::default(), &size, VoidListener));
+        let mut parser = Processor::<StdSyncHandler>::new();
+        let mut ingress = GraphicsIngress::new(GraphicsOptions::default());
+        let mut graphics = TerminalGraphicsState::default();
+        feed_kitty_grid(
+            &mut ingress,
+            &term,
+            &mut parser,
+            &mut graphics,
+            b"0123456789\x1b[1;1H\x1b_Ga=T,i=42,f=32,s=1,v=1,c=2,r=2,q=2;/wAA/w==\x1b\\X",
+            size,
+        );
+        let snapshot =
+            snapshot_from_term(&term.borrow(), size, &graphics, &TerminalPalette::default());
+        assert_eq!(
+            snapshot.lines[0]
+                .cells
+                .iter()
+                .take(10)
+                .map(|c| c.ch)
+                .collect::<String>(),
+            "0123456789"
+        );
+        assert_eq!(snapshot.lines[2].cells[2].ch, 'X');
+        feed_kitty_grid(
+            &mut ingress,
+            &term,
+            &mut parser,
+            &mut graphics,
+            b"\x1b[?1049h\x1b_Ga=T,i=42,f=32,s=1,v=1,C=1,q=2;AP8A/w==\x1b\\",
+            size,
+        );
+        assert_eq!(
+            graphics.visible_images(0, 6)[0]
+                .data
+                .as_ref()
+                .unwrap()
+                .rgba
+                .as_ref(),
+            &[0, 255, 0, 255]
+        );
+        feed_kitty_grid(
+            &mut ingress,
+            &term,
+            &mut parser,
+            &mut graphics,
+            b"\x1b[?1049l",
+            size,
+        );
+        assert_eq!(
+            graphics.visible_images(0, 6)[0]
+                .data
+                .as_ref()
+                .unwrap()
+                .rgba
+                .as_ref(),
+            &[255, 0, 0, 255]
+        );
+        feed_kitty_grid(
+            &mut ingress,
+            &term,
+            &mut parser,
+            &mut graphics,
+            b"\x1b[?1049h",
+            size,
+        );
+        assert!(graphics.visible_images(0, 6).is_empty());
+        feed_kitty_grid(&mut ingress, &term, &mut parser, &mut graphics, b"\x1b[?1049l\x1b[2J\x1b[1;1Habcdefghij\x1b[1;5H\x1b_Ga=T,i=43,f=32,s=1,v=1,C=1,q=2;AAD//w==\x1b\\", size);
+        size.cols = 3;
+        term.borrow_mut().resize(size);
+        feed_kitty_grid(&mut ingress, &term, &mut parser, &mut graphics, b"", size);
+        let anchor = graphics
+            .placements
+            .iter()
+            .find(|p| p.id == TerminalImageId(43))
+            .unwrap();
+        assert_eq!(anchor.col, 1);
+        assert_eq!(
+            term.borrow()
+                .grid()
+                .cell(alacritty_terminal::index::Point::new(
+                    Line(anchor.line),
+                    alacritty_terminal::index::Column(anchor.col)
+                ))
+                .c,
+            'e'
+        );
+        size.cols = 12;
+        term.borrow_mut().resize(size);
+        feed_kitty_grid(&mut ingress, &term, &mut parser, &mut graphics, b"", size);
+        let anchor = graphics
+            .placements
+            .iter()
+            .find(|p| p.id == TerminalImageId(43))
+            .unwrap();
+        assert_eq!(anchor.col, 4);
+        assert_eq!(
+            term.borrow()
+                .grid()
+                .cell(alacritty_terminal::index::Point::new(
+                    Line(anchor.line),
+                    alacritty_terminal::index::Column(anchor.col)
+                ))
+                .c,
+            'e'
+        );
+        let previous_line = anchor.line;
+        feed_kitty_grid(
+            &mut ingress,
+            &term,
+            &mut parser,
+            &mut graphics,
+            b"\x1b[6;1H\n",
+            size,
+        );
+        let anchor = graphics
+            .placements
+            .iter()
+            .find(|p| p.id == TerminalImageId(43))
+            .unwrap();
+        assert_eq!(anchor.line, previous_line - 1);
+        feed_kitty_grid(&mut ingress, &term, &mut parser, &mut graphics,
+            b"\x1b[2J\x1b[4;1Hz\x1b[2;1H\x1b_Ga=T,i=44,f=32,s=1,v=1,c=1,r=4,C=1,q=2;/wAA/w==\x1b\\\x1b[2;5r\x1b[5;1H\n\n", size);
+        let clipped = graphics
+            .placements
+            .iter()
+            .find(|p| p.id == TerminalImageId(44))
+            .unwrap();
+        assert_eq!(
+            (clipped.line, clipped.kitty.as_ref().unwrap().clip_top),
+            (-1, 2)
+        );
+        size.cols = 6;
+        term.borrow_mut().resize(size);
+        feed_kitty_grid(&mut ingress, &term, &mut parser, &mut graphics, b"", size);
+        let clipped = graphics
+            .placements
+            .iter()
+            .find(|p| p.id == TerminalImageId(44))
+            .unwrap();
+        let visible = clipped.line + clipped.kitty.as_ref().unwrap().clip_top as i32;
+        assert_eq!(
+            term.borrow()
+                .grid()
+                .cell(alacritty_terminal::index::Point::new(
+                    Line(visible),
+                    alacritty_terminal::index::Column(clipped.col)
+                ))
+                .c,
+            'z'
+        );
+        term.borrow_mut().set_options(Config {
+            scrolling_history: 0,
+            ..Default::default()
+        });
+        feed_kitty_grid(&mut ingress, &term, &mut parser, &mut graphics, b"", size);
+        assert!(
+            !graphics
+                .placements
+                .iter()
+                .any(|p| p.id == TerminalImageId(43))
+        );
+        feed_kitty_grid(
+            &mut ingress,
+            &term,
+            &mut parser,
+            &mut graphics,
+            b"\x1b[3J",
+            size,
+        );
+        assert!(
+            graphics
+                .visible_images(0, 6)
+                .iter()
+                .any(|p| p.id == TerminalImageId(44))
+        );
+    }
+
+    #[test]
+    fn kitty_unicode_rows_drive_virtual_parents_without_changing_text() {
+        let size = TerminalSize {
+            cols: 12,
+            rows: 6,
+            cell_width: 10,
+            cell_height: 20,
+        };
+        let term = std::cell::RefCell::new(Term::new(Config::default(), &size, VoidListener));
+        let mut parser = Processor::<StdSyncHandler>::new();
+        let mut ingress = GraphicsIngress::new(GraphicsOptions::default());
+        let mut graphics = TerminalGraphicsState::default();
+        let text = "\x1b[38;2;0;0;42;58;2;0;0;7m\u{10eeee}\u{305}\u{305}\u{10eeee}\x1b[0m";
+        feed_kitty_grid(
+            &mut ingress,
+            &term,
+            &mut parser,
+            &mut graphics,
+            text.as_bytes(),
+            size,
+        );
+        assert!(graphics.visible_images(0, 6).is_empty());
+        feed_kitty_grid(&mut ingress, &term, &mut parser, &mut graphics,
+            b"\x1b_Ga=T,i=42,p=7,U=1,c=4,r=2,f=32,s=1,v=1,q=2;/wAA/w==\x1b\\\x1b_Ga=T,i=43,p=8,P=42,Q=7,H=-1,V=1,c=2,r=1,f=32,s=1,v=1,q=2;AP8A/w==\x1b\\", size);
+        let images = graphics.visible_images(0, 6);
+        let marker = images
+            .iter()
+            .find(|p| p.kitty.as_ref().unwrap().unicode.is_some())
+            .unwrap();
+        assert_eq!(
+            (
+                marker.row,
+                marker.col,
+                marker
+                    .kitty
+                    .as_ref()
+                    .unwrap()
+                    .unicode
+                    .as_ref()
+                    .unwrap()
+                    .cols
+            ),
+            (0, 0, 2)
+        );
+        let child = images.iter().find(|p| p.id == TerminalImageId(43)).unwrap();
+        assert_eq!(
+            (
+                child.row,
+                child.col,
+                child.kitty.as_ref().unwrap().column_offset
+            ),
+            (1, 0, -1)
+        );
+        let point =
+            alacritty_terminal::index::Point::new(Line(0), alacritty_terminal::index::Column(0));
+        assert_eq!(term.borrow().grid().cell(point).c, '\u{10eeee}');
+        assert_eq!(
+            term.borrow().grid().cell(point).zerowidth(),
+            Some(&['\u{305}', '\u{305}'][..])
+        );
+        feed_kitty_grid(
+            &mut ingress,
+            &term,
+            &mut parser,
+            &mut graphics,
+            b"\x1b[1;1H\x1b[2K",
+            size,
+        );
+        assert!(graphics.visible_images(0, 6).is_empty());
+        feed_kitty_grid(
+            &mut ingress,
+            &term,
+            &mut parser,
+            &mut graphics,
+            "\x1b[2;4H\x1b[38;2;0;0;42;58;2;0;0;7m\u{10eeee}\u{305}\u{305}\x1b[0m".as_bytes(),
+            size,
+        );
+        let images = graphics.visible_images(0, 6);
+        let child = images.iter().find(|p| p.id == TerminalImageId(43)).unwrap();
+        assert_eq!((child.row, child.col), (2, 2));
+        feed_kitty_grid(
+            &mut ingress,
+            &term,
+            &mut parser,
+            &mut graphics,
+            b"\x1b[6;1H\n",
+            size,
+        );
+        let images = graphics.visible_images(0, 6);
+        let child = images.iter().find(|p| p.id == TerminalImageId(43)).unwrap();
+        assert_eq!((child.row, child.col), (1, 2));
+        feed_kitty_grid(
+            &mut ingress,
+            &term,
+            &mut parser,
+            &mut graphics,
+            b"\x1b_Ga=d,d=i,i=42,p=7,q=2\x1b\\",
+            size,
+        );
+        assert!(graphics.visible_images(0, 6).is_empty());
+        assert!(!graphics.images.contains_key(&TerminalImageId(43)));
     }
 
     #[test]
@@ -1315,7 +1703,7 @@ mod tests {
         let mut parser = Processor::<StdSyncHandler>::new();
         let mut ingress = GraphicsIngress::new(GraphicsOptions::default());
         let mut graphics = TerminalGraphicsState::default();
-        let mut alt_screen_active = false;
+        ingress.attach_grid(term.borrow_mut().graphics_events());
         let cursor = std::cell::Cell::new(graphics_cursor_from_term(&term.borrow(), size));
         let payload = "AAAA/////wAAAP8A";
         let sequence = format!(
@@ -1328,7 +1716,6 @@ mod tests {
                 TerminalGraphicsSegment::Terminal(bytes) => {
                     let mut term = term.borrow_mut();
                     parser.advance(&mut *term, &bytes);
-                    graphics.clear_for_alt_screen_transition(&term, &mut alt_screen_active);
                     cursor.set(graphics_cursor_from_term(&term, size));
                 }
                 TerminalGraphicsSegment::Event(event) => {
@@ -1733,28 +2120,78 @@ mod tests {
             cell_height: 17,
         };
         let cases = [
-            ("OSC 7 URI", "\x1b]7;file://build-host/home/dev/Oxide%20Term\x07", "/home/dev/Oxide Term", Some("build-host")),
-            ("private metadata version", "\x1b]7719;v=1;cwd=%2fwrong;host=%62%61%64\x07\x1b]7719;v=2;cwd=%2fhome%2fdev%2fAstrBot;host=%62%75%69%6c%64\x07", "/home/dev/AstrBot", Some("build")),
-            ("private Windows path", "\x1b]7719;v=2;cwd=C%3a%5cUsers%5calice;host=desktop\x07", "C:\\Users\\alice", Some("desktop")),
-            ("OSC 7 raw path", "\x1b]7;/tmp/Oxide%20Term\x07", "/tmp/Oxide Term", None),
-            ("OSC 633 property", "\x1b]633;P;Cwd=/work/Oxide%20Term\x07", "/work/Oxide Term", None),
-            ("OSC 1337 directory", "\x1b]1337;CurrentDir=/srv/Oxide%20Term\x07", "/srv/Oxide Term", None),
+            (
+                "OSC 7 URI",
+                "\x1b]7;file://build-host/home/dev/Oxide%20Term\x07",
+                "/home/dev/Oxide Term",
+                Some("build-host"),
+            ),
+            (
+                "private metadata version",
+                "\x1b]7719;v=1;cwd=%2fwrong;host=%62%61%64\x07\x1b]7719;v=2;cwd=%2fhome%2fdev%2fAstrBot;host=%62%75%69%6c%64\x07",
+                "/home/dev/AstrBot",
+                Some("build"),
+            ),
+            (
+                "private Windows path",
+                "\x1b]7719;v=2;cwd=C%3a%5cUsers%5calice;host=desktop\x07",
+                "C:\\Users\\alice",
+                Some("desktop"),
+            ),
+            (
+                "OSC 7 raw path",
+                "\x1b]7;/tmp/Oxide%20Term\x07",
+                "/tmp/Oxide Term",
+                None,
+            ),
+            (
+                "OSC 633 property",
+                "\x1b]633;P;Cwd=/work/Oxide%20Term\x07",
+                "/work/Oxide Term",
+                None,
+            ),
+            (
+                "OSC 1337 directory",
+                "\x1b]1337;CurrentDir=/srv/Oxide%20Term\x07",
+                "/srv/Oxide Term",
+                None,
+            ),
         ];
         for (scenario, payload, expected_cwd, expected_host) in cases {
             let mut term = Term::new(Config::default(), &size, VoidListener);
             let mut parser = Processor::<StdSyncHandler>::new();
             let mut integration = crate::shell_integration::TerminalShellIntegration::default();
             let mut events = Vec::new();
-            integration.advance(&mut parser, &mut term, format!("{payload}$ ").as_bytes(), |event| events.push(event));
+            integration.advance(
+                &mut parser,
+                &mut term,
+                format!("{payload}$ ").as_bytes(),
+                |event| events.push(event),
+            );
 
-            let cwd_events = events.iter().filter_map(|event| match event {
-                TerminalEvent::CwdChanged { cwd, host } => Some((cwd.as_str(), host.as_deref())),
-                _ => None,
-            }).collect::<Vec<_>>();
+            let cwd_events = events
+                .iter()
+                .filter_map(|event| match event {
+                    TerminalEvent::CwdChanged { cwd, host } => {
+                        Some((cwd.as_str(), host.as_deref()))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
             assert_eq!(cwd_events, [(expected_cwd, expected_host)], "{scenario}");
             assert!(integration.command_marks().is_empty(), "{scenario}");
-            let snapshot = snapshot_from_term(&term, size, &TerminalGraphicsState::default(), &TerminalPalette::default());
-            let visible_text = snapshot.lines.iter().map(|row| row.text()).collect::<Vec<_>>().join("\n");
+            let snapshot = snapshot_from_term(
+                &term,
+                size,
+                &TerminalGraphicsState::default(),
+                &TerminalPalette::default(),
+            );
+            let visible_text = snapshot
+                .lines
+                .iter()
+                .map(|row| row.text())
+                .collect::<Vec<_>>()
+                .join("\n");
             assert_eq!(visible_text.trim(), "$", "{scenario}");
         }
     }
@@ -1902,9 +2339,12 @@ mod tests {
             events.push(event)
         });
         assert!(integration.command_marks().is_empty());
-        integration.advance(&mut parser, &mut term, b"\x07\x1b]633;C\x07/home\r\n", |event| {
-            events.push(event)
-        });
+        integration.advance(
+            &mut parser,
+            &mut term,
+            b"\x07\x1b]633;C\x07/home\r\n",
+            |event| events.push(event),
+        );
 
         let marks = integration.command_marks();
         assert_eq!(marks.len(), 1);

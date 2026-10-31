@@ -27,7 +27,7 @@ use crate::recording_output::RecordingOutput;
 use alacritty_terminal::{
     event::{Event, EventListener, Notify, OnResize, WindowSize},
     sync::FairMutex,
-    term::{Term, TermMode},
+    term::Term,
     tty::{self, EventedPty, EventedReadWrite},
     vte::ansi,
 };
@@ -173,6 +173,7 @@ where
             let _ = magic_tx.send(kind);
         }
 
+        state.graphics.attach_grid(terminal.graphics_events());
         let cursor = Cell::new(graphics_cursor_from_term(terminal, size));
         let mut parsed_bytes = 0usize;
         let mut graphics_events = Vec::new();
@@ -190,7 +191,6 @@ where
             let trigger_stream = &mut state.trigger_stream;
             let privilege_prompt = &mut state.privilege_prompt;
             let shell_integration = &mut state.shell_integration;
-            let alt_screen_active = &mut state.alt_screen_active;
             graphics.advance_ordered(
                 bytes,
                 |segment| match segment {
@@ -237,17 +237,14 @@ where
                                 },
                             );
                         }
-                        if let Some(event) =
-                            LocalGraphicsState::alt_screen_clear_event(alt_screen_active, terminal)
-                        {
-                            graphics_events.push(event);
-                        }
                         cursor.set(graphics_cursor_from_term(terminal, size));
                     }
                     TerminalGraphicsSegment::Event(TerminalGraphicsEvent::Respond(bytes)) => {
                         priority_writes.push(Cow::Owned(bytes));
                     }
                     TerminalGraphicsSegment::Event(event) => {
+                        crate::apply_graphics_terminal_event(terminal, &event);
+                        cursor.set(graphics_cursor_from_term(terminal, size));
                         graphics_events.push(event);
                     }
                 },
@@ -469,6 +466,10 @@ where
                         );
                     }
                     self.pty.on_resize(window_size);
+                    let changes = state.graphics.synchronize_grid();
+                    if !changes.is_empty() {
+                        let _ = self.graphics_tx.send(TerminalGraphicsEvent::Batch(changes));
+                    }
                     if grid_changed {
                         if let Some(pending) = &state.recording_pending {
                             pending
@@ -1098,7 +1099,6 @@ struct LocalGraphicsState {
     encoding_detector: EncodingMismatchDetector,
     shell_integration: TerminalShellIntegration,
     modem_consumer: ModemConsumer,
-    alt_screen_active: bool,
     tmux_controller: Option<crate::tmux::TmuxController>,
 }
 
@@ -1131,7 +1131,6 @@ impl LocalGraphicsState {
             encoding_detector: EncodingMismatchDetector::new(encoding),
             shell_integration: TerminalShellIntegration::default(),
             modem_consumer: ModemConsumer::with_wake(modem_wake),
-            alt_screen_active: false,
             tmux_controller: Some(tmux_controller),
         }
     }
@@ -1241,21 +1240,6 @@ impl LocalGraphicsState {
         self.writing.as_ref().is_some_and(Writing::is_modem)
             || self.priority_writes.iter().any(Writing::is_modem)
             || self.write_list.iter().any(Writing::is_modem)
-    }
-
-    fn alt_screen_clear_event<U: EventListener>(
-        alt_screen_active: &mut bool,
-        terminal: &Term<U>,
-    ) -> Option<TerminalGraphicsEvent> {
-        let next_active = terminal.mode().contains(TermMode::ALT_SCREEN);
-        if next_active == *alt_screen_active {
-            return None;
-        }
-
-        *alt_screen_active = next_active;
-        // Local PTY graphics events are applied on the UI/session side, so emit a
-        // protocol-level clear at the same ordered point as the screen switch.
-        Some(TerminalGraphicsEvent::Delete { id: None })
     }
 }
 

@@ -28,6 +28,7 @@ use crate::vte::ansi::{
 
 pub mod cell;
 pub mod color;
+pub mod graphics;
 pub mod search;
 
 /// Minimum number of columns.
@@ -239,6 +240,7 @@ impl Iterator for TermDamageIterator<'_> {
 
 /// State of the terminal damage.
 struct TermDamageState {
+    graphics: Option<graphics::GraphicsGridEvents>,
     /// Hint whether terminal should be damaged entirely regardless of the actual damage changes.
     full: bool,
 
@@ -257,7 +259,7 @@ impl TermDamageState {
         let lines =
             (0..num_lines).map(|line| LineDamageBounds::undamaged(line, num_cols)).collect();
 
-        Self { full: true, scroll_up: 0, lines, last_cursor: Default::default() }
+        Self { full: true, scroll_up: 0, lines, last_cursor: Default::default(), graphics: None }
     }
 
     #[inline]
@@ -283,6 +285,7 @@ impl TermDamageState {
     /// Expand `line`'s damage to span at least `left` to `right` column.
     #[inline]
     fn damage_line(&mut self, line: usize, left: usize, right: usize) {
+        if let Some(events) = &self.graphics { events.dirty_row(line as i32); }
         self.lines[line].expand(left, right);
     }
 
@@ -362,6 +365,7 @@ pub struct Term<T> {
     /// Information about damaged cells.
     damage: TermDamageState,
     resize_generation: u64,
+    graphics_events: Option<graphics::GraphicsGridEvents>,
 
     /// Config directly for the terminal.
     config: Config,
@@ -423,6 +427,14 @@ pub enum Osc52 {
 }
 
 impl<T> Term<T> {
+    pub fn graphics_events(&mut self) -> graphics::GraphicsGridEvents {
+        let events = self.graphics_events.get_or_insert_with(Default::default).clone();
+        events
+    }
+
+    fn record_graphics_change(&self, change: graphics::GraphicsGridChange) {
+        if let Some(events) = &self.graphics_events { events.record(change); }
+    }
     #[inline]
     pub fn scroll_display(&mut self, scroll: Scroll)
     where
@@ -466,6 +478,7 @@ impl<T> Term<T> {
             event_proxy,
             damage,
             resize_generation: 0,
+            graphics_events: None,
             config,
             grid,
             tabs,
@@ -538,6 +551,11 @@ impl<T> Term<T> {
     #[inline]
     pub fn mark_fully_damaged(&mut self) {
         self.damage.full = true;
+        if let Some(events) = &self.graphics_events
+            && events.has_placeholders()
+        {
+            for line in 0..self.screen_lines() { events.dirty_row(line as i32); }
+        }
     }
 
     /// Set new options for the [`Term`].
@@ -559,6 +577,8 @@ impl<T> Term<T> {
         } else {
             self.grid.update_history(self.config.scrolling_history);
         }
+        let primary = if self.mode.contains(TermMode::ALT_SCREEN) { &self.inactive_grid } else { &self.grid };
+        self.record_graphics_change(graphics::GraphicsGridChange::TrimHistory { topmost: primary.topmost_line().0 });
 
         if self.config.kitty_keyboard != old_config.kitty_keyboard {
             self.keyboard_mode_stack = Vec::new();
@@ -765,8 +785,26 @@ impl<T> Term<T> {
         self.vi_mode_cursor.point.line += delta;
 
         let is_alt = self.mode.contains(TermMode::ALT_SCREEN);
+        let old_graphics = self.graphics_events.as_ref().map(|events| {
+            [(&self.grid, is_alt), (&self.inactive_grid, !is_alt)].map(|(grid, screen)| {
+                let anchors = events.anchors(screen);
+                if anchors.is_empty() { return (screen, Vec::new(), 0); }
+                let mut points = anchors.iter().map(|(_, point)| *point).collect::<Vec<_>>();
+                points.push(grid.cursor.point);
+                let mut logical = graphics::logical_positions(grid, &points);
+                let cursor_group = logical.pop().flatten().map_or(0, |p| p.0);
+                (screen, anchors.into_iter().zip(logical).map(|((id, _), logical)| (id, logical)).collect::<Vec<_>>(), cursor_group)
+            })
+        });
         self.grid.resize(!is_alt, num_lines, num_cols);
         self.inactive_grid.resize(is_alt, num_lines, num_cols);
+        if let (Some(events), Some(old)) = (&self.graphics_events, old_graphics) {
+            for (screen, points, cursor_group) in old {
+                if points.is_empty() { continue; }
+                let grid = if screen == is_alt { &self.grid } else { &self.inactive_grid };
+                events.reflow(screen, grid, &points, cursor_group);
+            }
+        }
 
         // Invalidate selection and tabs only when necessary.
         if old_cols != num_cols {
@@ -821,6 +859,7 @@ impl<T> Term<T> {
 
         mem::swap(&mut self.grid, &mut self.inactive_grid);
         self.mode ^= TermMode::ALT_SCREEN;
+        self.record_graphics_change(graphics::GraphicsGridChange::Screen { alternate: self.mode.contains(TermMode::ALT_SCREEN) });
         self.selection = None;
         self.mark_fully_damaged();
     }
@@ -850,6 +889,7 @@ impl<T> Term<T> {
 
         // Scroll between origin and bottom
         self.grid.scroll_down(&region, lines);
+        self.record_graphics_change(graphics::GraphicsGridChange::Scroll { alternate: self.mode.contains(TermMode::ALT_SCREEN), start: origin.0, end: self.scroll_region.end.0, delta: lines as i32, topmost: self.grid.topmost_line().0, history: false });
         self.mark_fully_damaged();
     }
 
@@ -869,6 +909,7 @@ impl<T> Term<T> {
         self.selection = self.selection.take().and_then(|s| s.rotate(self, &region, lines as i32));
 
         self.grid.scroll_up(&region, lines);
+        self.record_graphics_change(graphics::GraphicsGridChange::Scroll { alternate: self.mode.contains(TermMode::ALT_SCREEN), start: origin.0, end: self.scroll_region.end.0, delta: -(lines as i32), topmost: self.grid.topmost_line().0, history: origin.0 == 0 && self.scroll_region.end.0 == self.screen_lines() as i32 && !self.mode.contains(TermMode::ALT_SCREEN) });
 
         // Scroll vi mode cursor.
         let viewport_top = Line(-(self.grid.display_offset() as i32));
@@ -1138,35 +1179,9 @@ impl<T> Term<T> {
 }
 
 impl<T: EventListener> Term<T> {
-    /// Only host palette changes notify subscribers; application OSC changes do not.
-    pub fn notify_palette_changed(&mut self) {
-        if self.mode.contains(TermMode::REPORT_COLOR_SCHEME) {
-            self.private_device_status(996);
-        }
-    }
-}
-
-impl<T> Dimensions for Term<T> {
-    #[inline]
-    fn columns(&self) -> usize {
-        self.grid.columns()
-    }
-
-    #[inline]
-    fn screen_lines(&self) -> usize {
-        self.grid.screen_lines()
-    }
-
-    #[inline]
-    fn total_lines(&self) -> usize {
-        self.grid.total_lines()
-    }
-}
-
-impl<T: EventListener> Handler for Term<T> {
     /// A character to be displayed.
     #[inline(never)]
-    fn input(&mut self, c: char) {
+    fn input_character(&mut self, c: char) {
         // Number of cells the char will occupy.
         let width = match c.width() {
             Some(width) => width,
@@ -1244,6 +1259,52 @@ impl<T: EventListener> Handler for Term<T> {
         }
     }
 
+    // Keep placeholder bookkeeping out of the ordinary scalar writer.
+    fn input_graphics_character(&mut self, c: char) {
+        if c == '\u{10eeee}' && let Some(events) = &self.graphics_events {
+            events.enable_placeholders();
+            self.damage.graphics = Some(events.clone());
+        }
+        if let Some(events) = &self.damage.graphics { events.dirty_row(self.grid.cursor.point.line.0); }
+        self.input_character(c);
+        if let Some(events) = &self.damage.graphics { events.dirty_row(self.grid.cursor.point.line.0); }
+    }
+
+    /// Only host palette changes notify subscribers; application OSC changes do not.
+    pub fn notify_palette_changed(&mut self) {
+        if self.mode.contains(TermMode::REPORT_COLOR_SCHEME) {
+            self.private_device_status(996);
+        }
+    }
+}
+
+impl<T> Dimensions for Term<T> {
+    #[inline]
+    fn columns(&self) -> usize {
+        self.grid.columns()
+    }
+
+    #[inline]
+    fn screen_lines(&self) -> usize {
+        self.grid.screen_lines()
+    }
+
+    #[inline]
+    fn total_lines(&self) -> usize {
+        self.grid.total_lines()
+    }
+}
+
+impl<T: EventListener> Handler for Term<T> {
+    #[inline]
+    fn input(&mut self, c: char) {
+        if c == '\u{10eeee}' || self.damage.graphics.is_some() {
+            self.input_graphics_character(c);
+        } else {
+            self.input_character(c);
+        }
+    }
+
     /// A printable text span to write through the common single-column ASCII path.
     fn input_text(&mut self, text: &str) {
         let active_charset = self.grid.cursor.charsets[self.active_charset];
@@ -1272,6 +1333,7 @@ impl<T: EventListener> Handler for Term<T> {
             let line = self.grid.cursor.point.line;
             let start = self.grid.cursor.point.column.0;
             let write_len = (columns - start).min(bytes.len() - processed);
+            if let Some(events) = &self.damage.graphics { events.dirty_row(line.0); }
             let end = start + write_len;
 
             let template = self.grid.cursor.template.clone();
@@ -1378,6 +1440,7 @@ impl<T: EventListener> Handler for Term<T> {
             for offset in 0..batch_lines {
                 let line = next_ascii_line(text, &mut text_offset);
                 let line_index = first_line + offset as i32;
+                if let Some(events) = &self.damage.graphics { events.dirty_row(line_index.0); }
                 for (cell, byte) in self.grid[line_index].cells_mut(0..line.len())
                     .iter_mut()
                     .zip(line.bytes())
@@ -2015,6 +2078,9 @@ impl<T: EventListener> Handler for Term<T> {
     #[inline]
     fn clear_screen(&mut self, mode: ansi::ClearMode) {
         trace!("Clearing screen: {mode:?}");
+        if matches!(mode, ansi::ClearMode::All | ansi::ClearMode::Saved) {
+            self.record_graphics_change(graphics::GraphicsGridChange::Clear { alternate: self.mode.contains(TermMode::ALT_SCREEN), history: matches!(mode, ansi::ClearMode::Saved) });
+        }
         let bg = self.grid.cursor.template.bg;
 
         let screen_lines = self.screen_lines();
@@ -2058,7 +2124,10 @@ impl<T: EventListener> Handler for Term<T> {
                 } else {
                     let old_offset = self.grid.display_offset();
 
-                    self.grid.clear_viewport();
+                    let scrolled = self.grid.clear_viewport();
+                    if scrolled > 0 {
+                        self.record_graphics_change(graphics::GraphicsGridChange::Scroll { alternate: false, start: 0, end: screen_lines as i32, delta: -(scrolled as i32), topmost: self.grid.topmost_line().0, history: true });
+                    }
 
                     // Compute number of lines scrolled by clearing the viewport.
                     let lines = self.grid.display_offset().saturating_sub(old_offset);
@@ -2100,6 +2169,7 @@ impl<T: EventListener> Handler for Term<T> {
     /// Reset all important fields in the term struct.
     #[inline]
     fn reset_state(&mut self) {
+        self.record_graphics_change(graphics::GraphicsGridChange::Reset);
         if self.mode.contains(TermMode::ALT_SCREEN) {
             mem::swap(&mut self.grid, &mut self.inactive_grid);
         }

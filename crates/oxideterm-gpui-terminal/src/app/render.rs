@@ -2329,6 +2329,23 @@ impl TerminalPane {
                         |this, _, window, cx| this.edit_clipboard_paste(window, cx),
                         cx,
                     ))
+                    .when(self.kitty_file_transmission.is_some(), |menu| {
+                        menu.child(
+                            self.render_terminal_context_menu_item(
+                                self.preferences
+                                    .kitty_file_transmission_labels
+                                    .title
+                                    .clone(),
+                                self.terminal_exited,
+                                |this, _, _, cx| {
+                                    this.dismiss_terminal_context_menu(cx);
+                                    this.kitty_file_transmission_confirm_open = true;
+                                    cx.notify();
+                                },
+                                cx,
+                            ),
+                        )
+                    })
                     .child(self.render_terminal_context_menu_item(
                         insert_selection_label,
                         !free_type_insert_selection_available,

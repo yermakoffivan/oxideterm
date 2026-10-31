@@ -14,12 +14,7 @@ struct KittyFileTransmissionControlInner {
 enum KittyFileTransmissionState {
     AwaitingDecision { request_pending: bool },
     Denied,
-    Trusted(KittyFileTransmissionSandbox),
-}
-
-struct KittyFileTransmissionSandbox {
-    directory: TempDir,
-    session_token: Zeroizing<String>,
+    Trusted,
 }
 
 impl KittyFileTransmissionControl {
@@ -43,46 +38,14 @@ impl KittyFileTransmissionControl {
         std::mem::take(request_pending)
     }
 
-    pub fn authorize_for_session(&self) -> std::io::Result<PathBuf> {
+    pub fn authorize_for_session(&self) -> std::io::Result<()> {
         let mut state = self
             .inner
             .state
             .lock()
-            .map_err(|_| std::io::Error::other("Kitty file transmission state is unavailable"))?;
-        match &*state {
-            KittyFileTransmissionState::Trusted(sandbox) => {
-                return Ok(sandbox.directory.path().to_path_buf());
-            }
-            KittyFileTransmissionState::Denied => {
-                // A denial is final for this session so stale UI actions cannot
-                // revive a capability after the user rejected the request.
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "Kitty file transmission was denied for this session",
-                ));
-            }
-            KittyFileTransmissionState::AwaitingDecision { .. } => {}
-        }
-
-        // The random directory name is the session capability. It is never
-        // persisted or logged, and TempDir removes the owned root on drop.
-        let session_token = Zeroizing::new(Uuid::new_v4().simple().to_string());
-        let directory_prefix =
-            Zeroizing::new(format!("oxideterm-kitty-{}-", session_token.as_str()));
-        let directory = tempfile::Builder::new()
-            .prefix(directory_prefix.as_str())
-            .tempdir()?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
-        }
-        let path = directory.path().to_path_buf();
-        *state = KittyFileTransmissionState::Trusted(KittyFileTransmissionSandbox {
-            directory,
-            session_token,
-        });
-        Ok(path)
+            .map_err(|_| std::io::Error::other("Kitty file authorization is unavailable"))?;
+        *state = KittyFileTransmissionState::Trusted;
+        Ok(())
     }
 
     pub fn deny_for_session(&self) {
@@ -91,28 +54,31 @@ impl KittyFileTransmissionControl {
         }
     }
 
+    pub fn revoke(&self) {
+        if let Ok(mut state) = self.inner.state.lock() {
+            *state = KittyFileTransmissionState::AwaitingDecision {
+                request_pending: false,
+            };
+        }
+    }
+
+    pub fn request_authorization(&self) {
+        self.note_authorization_request();
+    }
+
     fn note_authorization_request(&self) {
-        let Ok(mut state) = self.inner.state.lock() else {
-            return;
-        };
-        if let KittyFileTransmissionState::AwaitingDecision { request_pending } = &mut *state {
+        if let Ok(mut state) = self.inner.state.lock()
+            && let KittyFileTransmissionState::AwaitingDecision { request_pending } = &mut *state
+        {
             *request_pending = true;
         }
     }
 
-    fn authorized_root(&self) -> Option<PathBuf> {
-        let state = self.inner.state.lock().ok()?;
-        match &*state {
-            KittyFileTransmissionState::Trusted(sandbox) => sandbox
-                .directory
-                .path()
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.contains(sandbox.session_token.as_str()))
-                .then(|| sandbox.directory.path().to_path_buf()),
-            KittyFileTransmissionState::AwaitingDecision { .. }
-            | KittyFileTransmissionState::Denied => None,
-        }
+    fn is_authorized(&self) -> bool {
+        self.inner
+            .state
+            .lock()
+            .is_ok_and(|state| matches!(*state, KittyFileTransmissionState::Trusted))
     }
 }
 
@@ -131,13 +97,12 @@ impl std::fmt::Debug for KittyFileTransmissionControl {
             .map(|state| match &*state {
                 KittyFileTransmissionState::AwaitingDecision { .. } => "awaiting-decision",
                 KittyFileTransmissionState::Denied => "denied",
-                KittyFileTransmissionState::Trusted(_) => "trusted",
+                KittyFileTransmissionState::Trusted => "trusted",
             })
             .unwrap_or("unavailable");
         formatter
             .debug_struct("KittyFileTransmissionControl")
             .field("decision", &decision)
-            .field("sandbox", &"[redacted session capability]")
             .finish()
     }
 }
@@ -223,15 +188,16 @@ pub struct TerminalImageFrame {
     pub gapless: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[derive(Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TerminalImageAnimationState {
     pub running: bool,
     pub loading: bool,
     pub current_frame: usize,
     pub loop_limit: Option<u32>,
+    pub control_serial: u64,
+    pub seek: Option<usize>,
+    pub reset_loops: bool,
 }
-
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TerminalImagePlacement {
@@ -250,6 +216,33 @@ pub struct TerminalImagePlacement {
     pub source_height: u32,
     pub z_index: i32,
     pub placeholder: bool,
+    pub kitty: Option<KittyPlacement>,
+    pub alternate_screen: bool,
+}
+
+/// Protocol placement identity is independent of the shared pixel resource.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KittyPlacement {
+    pub serial: u64,
+    pub id: u32,
+    pub offset_x: u32,
+    pub offset_y: u32,
+    pub scaled: bool,
+    pub virtual_placement: bool,
+    pub parent: Option<(TerminalImageId, u32, i32, i32)>,
+    pub clip_top: usize,
+    pub clip_bottom: usize,
+    pub image_id: u32,
+    pub column_offset: i64,
+    pub hidden: bool,
+    pub unicode: Option<KittyPlaceholderRegion>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KittyPlaceholderRegion {
+    pub row: usize,
+    pub col: usize,
+    pub cols: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -259,6 +252,9 @@ pub enum TerminalGraphicsEvent {
     Place(TerminalImagePlacement),
     Delete { id: Option<TerminalImageId> },
     DeletePlacements { id: Option<TerminalImageId> },
+    DeletePlacement { serial: u64 },
+    Screen { alternate: bool },
+    MoveCursor { cols: usize, rows: usize },
     Batch(Vec<TerminalGraphicsEvent>),
     Respond(Vec<u8>),
     Error(String),
@@ -299,6 +295,16 @@ impl GraphicsCursor {
 
 #[derive(Debug, Error)]
 pub enum GraphicsError {
+    #[error("ENOPARENT:Parent placement not found")]
+    ParentNotFound,
+    #[error("ECYCLE:Relative placement cycle")]
+    PlacementCycle,
+    #[error("ETOODEEP:Relative placement depth exceeded")]
+    PlacementDepth,
+    #[error("EINVAL:Invalid graphics command")]
+    InvalidCommand,
+    #[error("ENOENT:Image or placement not found")]
+    ImageNotFound,
     #[error("image is larger than the configured pixel limit")]
     PixelLimitExceeded,
     #[error("invalid base64 image payload")]
@@ -336,6 +342,16 @@ pub struct GraphicsIngress {
     next_image_id: u64,
     kitty_chunks: HashMap<u64, KittyChunkAssembly>,
     kitty_images: HashMap<TerminalImageId, TerminalImageData>,
+    kitty_numbers: HashMap<(bool, u32), Vec<TerminalImageId>>,
+    kitty_wire_ids: HashMap<(bool, u32), TerminalImageId>,
+    kitty_placements: Vec<TerminalImagePlacement>,
+    next_placement_serial: u64,
+    grid_events: Option<alacritty_terminal::term::graphics::GraphicsGridEvents>,
+    alternate_screen: bool,
+    placeholder_rows: HashMap<(bool, i32), Vec<IndexedPlaceholder>>,
+    placeholder_rendered: HashMap<u64, TerminalImagePlacement>,
+    placeholders_changed: bool,
+    placeholder_index_incomplete: bool,
     image_order: VecDeque<(TerminalImageId, usize)>,
     storage_bytes: usize,
     sync_buffer: Option<Zeroizing<Vec<u8>>>,

@@ -57,6 +57,7 @@ use oxideterm_terminal_recording::{
 };
 
 mod command_folding;
+mod image_animation;
 mod image_cache;
 mod ime;
 mod interactions;
@@ -3493,12 +3494,7 @@ impl TerminalPane {
             .ok_or_else(|| std::io::Error::other("Kitty file transmission is unavailable"))
             .and_then(KittyFileTransmissionControl::authorize_for_session);
         match result {
-            Ok(sandbox_path) => {
-                // Clipboard export is the explicit user-authorized capability boundary;
-                // the path is never retained by pane state, logs, or persistence.
-                cx.write_to_clipboard(ClipboardItem::new_string(
-                    sandbox_path.to_string_lossy().into_owned(),
-                ));
+            Ok(()) => {
                 self.emit_kitty_file_transmission_notice(
                     labels.allowed_title.clone(),
                     labels.allowed_description.clone(),

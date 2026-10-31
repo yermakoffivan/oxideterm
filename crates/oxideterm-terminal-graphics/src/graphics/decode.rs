@@ -109,75 +109,311 @@ fn decode_kitty_payload(
     file_transmission: &KittyFileTransmissionControl,
 ) -> Result<Vec<u8>, GraphicsError> {
     let transmission = params.get("t").map(String::as_str).unwrap_or("d");
-    let payload = BASE64
-        .decode(encoded)
-        .map_err(|_| GraphicsError::InvalidBase64)?;
+    let payload = Zeroizing::new(
+        BASE64
+            .decode(encoded)
+            .map_err(|_| GraphicsError::InvalidBase64)?,
+    );
     enforce_storage_limit(payload.len(), storage_limit_mb)?;
-
-    match transmission {
-        "d" => Ok(payload),
-        "f" | "t" => {
-            let path = String::from_utf8(payload)
-                .map_err(|_| GraphicsError::InvalidLocalFileTransmissionPath)?;
-            let path = Path::new(path.trim_end_matches('\0'));
-            read_kitty_file_from_session_sandbox(path, storage_limit_mb, file_transmission)
+    let offset = u64::from(parse_u32(params.get("O")).unwrap_or(0));
+    let length = parse_u32(params.get("S")).filter(|n| *n > 0).map(u64::from);
+    let bytes = match transmission {
+        "d" => payload.to_vec(),
+        "f" | "t" | "s" => {
+            if !file_transmission.is_authorized() {
+                file_transmission.note_authorization_request();
+                return Err(GraphicsError::LocalFileTransmissionDisabled);
+            }
+            let name = Zeroizing::new(
+                String::from_utf8(payload.to_vec())
+                    .map_err(|_| GraphicsError::LocalFileTransmissionAccessFailed)?,
+            );
+            if name.contains('\0') {
+                return Err(GraphicsError::LocalFileTransmissionAccessFailed);
+            }
+            if transmission == "s" {
+                read_kitty_shared_memory(&name, offset, length, storage_limit_mb)?
+            } else {
+                read_kitty_file(
+                    Path::new(name.as_str()),
+                    transmission == "t",
+                    offset,
+                    length,
+                    storage_limit_mb,
+                )?
+            }
+        }
+        _ => return Err(GraphicsError::UnsupportedImage),
+    };
+    match params.get("o").map(String::as_str) {
+        None => Ok(bytes),
+        Some("z") => {
+            let input = Zeroizing::new(bytes);
+            let decoder = flate2::read::ZlibDecoder::new(input.as_slice());
+            let limit = storage_limit_mb.max(1) as u64 * 1024 * 1024;
+            let mut output = Vec::new();
+            decoder
+                .take(limit + 1)
+                .read_to_end(&mut output)
+                .map_err(|_| GraphicsError::InvalidCommand)?;
+            enforce_storage_limit(output.len(), storage_limit_mb)?;
+            Ok(output)
         }
         _ => Err(GraphicsError::UnsupportedImage),
     }
 }
 
-fn read_kitty_file_from_session_sandbox(
-    requested_path: &Path,
+fn read_kitty_slice(
+    mut file: fs::File,
+    offset: u64,
+    length: Option<u64>,
     storage_limit_mb: u32,
-    file_transmission: &KittyFileTransmissionControl,
 ) -> Result<Vec<u8>, GraphicsError> {
-    let Some(sandbox_root) = file_transmission.authorized_root() else {
-        file_transmission.note_authorization_request();
-        return Err(GraphicsError::LocalFileTransmissionDisabled);
-    };
-    if !requested_path.is_absolute() {
-        return Err(GraphicsError::InvalidLocalFileTransmissionPath);
-    }
-
-    let requested_metadata = fs::symlink_metadata(requested_path)
-        .map_err(|_| GraphicsError::LocalFileTransmissionAccessFailed)?;
-    if requested_metadata.file_type().is_symlink() || !requested_metadata.is_file() {
-        return Err(GraphicsError::InvalidLocalFileTransmissionPath);
-    }
-
-    let canonical_root = fs::canonicalize(&sandbox_root)
-        .map_err(|_| GraphicsError::LocalFileTransmissionAccessFailed)?;
-    let canonical_path = fs::canonicalize(requested_path)
-        .map_err(|_| GraphicsError::LocalFileTransmissionAccessFailed)?;
-    let is_direct_sandbox_file = canonical_path.parent() == Some(canonical_root.as_path());
-    let has_protocol_marker = canonical_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.contains("tty-graphics-protocol"));
-    if !is_direct_sandbox_file || !has_protocol_marker {
-        return Err(GraphicsError::InvalidLocalFileTransmissionPath);
-    }
-
-    enforce_storage_limit(requested_metadata.len() as usize, storage_limit_mb)?;
-    let file = fs::File::open(&canonical_path)
-        .map_err(|_| GraphicsError::LocalFileTransmissionAccessFailed)?;
-    if !file
+    use std::io::{Seek, SeekFrom};
+    let metadata = file
         .metadata()
-        .map_err(|_| GraphicsError::LocalFileTransmissionAccessFailed)?
-        .is_file()
-    {
-        return Err(GraphicsError::InvalidLocalFileTransmissionPath);
-    }
-    let limit = storage_limit_mb.max(1) as u64 * 1024 * 1024;
-    let mut bytes = Vec::with_capacity(requested_metadata.len() as usize);
-    file.take(limit.saturating_add(1))
-        .read_to_end(&mut bytes)
         .map_err(|_| GraphicsError::LocalFileTransmissionAccessFailed)?;
-    enforce_storage_limit(bytes.len(), storage_limit_mb)?;
+    let available = metadata
+        .len()
+        .checked_sub(offset)
+        .ok_or(GraphicsError::LocalFileTransmissionAccessFailed)?;
+    let count = length.unwrap_or(available);
+    if count > available {
+        return Err(GraphicsError::LocalFileTransmissionAccessFailed);
+    }
+    enforce_storage_limit(
+        usize::try_from(count).map_err(|_| GraphicsError::StorageLimitExceeded)?,
+        storage_limit_mb,
+    )?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|_| GraphicsError::LocalFileTransmissionAccessFailed)?;
+    let mut output = Vec::with_capacity(count as usize);
+    file.take(count)
+        .read_to_end(&mut output)
+        .map_err(|_| GraphicsError::LocalFileTransmissionAccessFailed)?;
+    if output.len() as u64 != count {
+        return Err(GraphicsError::LocalFileTransmissionAccessFailed);
+    }
+    Ok(output)
+}
 
-    // `t=t` is intentionally not unlinked here. The private TempDir owner
-    // performs bounded cleanup when the session is denied, revoked, or dropped.
+fn read_kitty_file(
+    path: &Path,
+    temporary: bool,
+    offset: u64,
+    length: Option<u64>,
+    storage_limit_mb: u32,
+) -> Result<Vec<u8>, GraphicsError> {
+    let failed = || GraphicsError::LocalFileTransmissionAccessFailed;
+    if !path.is_absolute() {
+        return Err(failed());
+    }
+    let canonical = fs::canonicalize(path).map_err(|_| failed())?;
+    #[cfg(unix)]
+    if ["/dev", "/proc", "/sys"]
+        .iter()
+        .any(|root| canonical.starts_with(root))
+    {
+        return Err(failed());
+    }
+    #[cfg(windows)]
+    if canonical
+        .to_string_lossy()
+        .to_ascii_uppercase()
+        .contains("GLOBALROOT")
+    {
+        return Err(failed());
+    }
+    if !fs::metadata(&canonical).map_err(|_| failed())?.is_file() {
+        return Err(failed());
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A replaced FIFO must not block the terminal reader.
+        options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let file = options.open(&canonical).map_err(|_| failed())?;
+    if !file.metadata().map_err(|_| failed())?.is_file() {
+        return Err(failed());
+    }
+    let bytes = read_kitty_slice(file, offset, length, storage_limit_mb)?;
+    if temporary
+        && canonical
+            .to_string_lossy()
+            .contains("tty-graphics-protocol")
+    {
+        let temporary = std::env::temp_dir();
+        let roots = std::iter::once(temporary.as_path());
+        #[cfg(unix)]
+        let roots = roots.chain(["/tmp", "/var/tmp", "/dev/shm"].map(Path::new));
+        if roots
+            .filter_map(|root| fs::canonicalize(root).ok())
+            .any(|root| canonical.starts_with(root))
+        {
+            fs::remove_file(&canonical).map_err(|_| failed())?;
+        }
+    }
     Ok(bytes)
+}
+
+#[cfg(unix)]
+fn read_kitty_shared_memory(
+    name: &str,
+    offset: u64,
+    length: Option<u64>,
+    storage_limit_mb: u32,
+) -> Result<Vec<u8>, GraphicsError> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let failed = || GraphicsError::LocalFileTransmissionAccessFailed;
+    if !name.starts_with('/') || name.len() < 2 || name[1..].contains('/') {
+        return Err(failed());
+    }
+    let name = std::ffi::CString::new(name).map_err(|_| failed())?;
+    // The descriptor has one owner even when a bounded read fails.
+    let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
+    if fd < 0 {
+        return Err(failed());
+    }
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        return Err(failed());
+    }
+    let available = file
+        .metadata()
+        .map_err(|_| failed())?
+        .len()
+        .checked_sub(offset)
+        .ok_or_else(failed)?;
+    let count = length.unwrap_or(available);
+    if count == 0 || count > available {
+        return Err(failed());
+    }
+    enforce_storage_limit(
+        usize::try_from(count).map_err(|_| GraphicsError::StorageLimitExceeded)?,
+        storage_limit_mb,
+    )?;
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page <= 0 {
+        return Err(failed());
+    }
+    let aligned = offset / page as u64 * page as u64;
+    let skip = (offset - aligned) as usize;
+    let mapped = skip
+        .checked_add(count as usize)
+        .ok_or(GraphicsError::StorageLimitExceeded)?;
+    let address = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            mapped,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            aligned as libc::off_t,
+        )
+    };
+    if address == libc::MAP_FAILED {
+        return Err(failed());
+    }
+    let bytes =
+        unsafe { std::slice::from_raw_parts(address.cast::<u8>().add(skip), count as usize) }
+            .to_vec();
+    unsafe {
+        libc::munmap(address, mapped);
+    }
+    if unsafe { libc::shm_unlink(name.as_ptr()) } != 0 {
+        return Err(failed());
+    }
+    Ok(bytes)
+}
+
+#[cfg(windows)]
+fn read_kitty_shared_memory(
+    name: &str,
+    offset: u64,
+    length: Option<u64>,
+    storage_limit_mb: u32,
+) -> Result<Vec<u8>, GraphicsError> {
+    use std::ffi::c_void;
+    #[repr(C)]
+    struct MemoryInfo {
+        base: *mut c_void,
+        allocation_base: *mut c_void,
+        protection: u32,
+        partition: u16,
+        region_size: usize,
+        state: u32,
+        protect: u32,
+        kind: u32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenFileMappingW(access: u32, inherit: i32, name: *const u16) -> *mut c_void;
+        fn MapViewOfFile(
+            handle: *mut c_void,
+            access: u32,
+            high: u32,
+            low: u32,
+            count: usize,
+        ) -> *mut c_void;
+        fn UnmapViewOfFile(address: *const c_void) -> i32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+        fn VirtualQuery(address: *const c_void, info: *mut MemoryInfo, count: usize) -> usize;
+    }
+    let failed = || GraphicsError::LocalFileTransmissionAccessFailed;
+    let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+    let base_offset = offset & !65535;
+    let skip = (offset - base_offset) as usize;
+    let count = match length {
+        Some(n) => {
+            enforce_storage_limit(
+                usize::try_from(n).map_err(|_| GraphicsError::StorageLimitExceeded)?,
+                storage_limit_mb,
+            )?;
+            skip.checked_add(n as usize)
+                .ok_or(GraphicsError::StorageLimitExceeded)?
+        }
+        None => 0,
+    };
+    let handle = unsafe { OpenFileMappingW(4, 0, name.as_ptr()) };
+    if handle.is_null() {
+        return Err(failed());
+    }
+    let address = unsafe {
+        MapViewOfFile(
+            handle,
+            4,
+            (base_offset >> 32) as u32,
+            base_offset as u32,
+            count,
+        )
+    };
+    if address.is_null() {
+        unsafe {
+            CloseHandle(handle);
+        }
+        return Err(failed());
+    }
+    let result = (|| {
+        let mut info: MemoryInfo = unsafe { std::mem::zeroed() };
+        if unsafe { VirtualQuery(address, &mut info, std::mem::size_of::<MemoryInfo>()) } == 0 {
+            return Err(failed());
+        }
+        let available = info.region_size.checked_sub(skip).ok_or_else(failed)?;
+        let length = length.map(|n| n as usize).unwrap_or(available);
+        if length > available {
+            return Err(failed());
+        }
+        enforce_storage_limit(length, storage_limit_mb)?;
+        Ok(unsafe { std::slice::from_raw_parts(address.cast::<u8>().add(skip), length) }.to_vec())
+    })();
+    unsafe {
+        UnmapViewOfFile(address);
+        CloseHandle(handle);
+    }
+    result
 }
 
 fn decode_raw_rgb(
@@ -243,7 +479,12 @@ fn enforce_raw_len(
 }
 
 fn enforce_pixel_limit(width: u32, height: u32, pixel_limit: u32) -> Result<(), GraphicsError> {
-    if width.saturating_mul(height) <= pixel_limit {
+    if width > 0
+        && height > 0
+        && width
+            .checked_mul(height)
+            .is_some_and(|pixels| pixels <= pixel_limit)
+    {
         Ok(())
     } else {
         Err(GraphicsError::PixelLimitExceeded)

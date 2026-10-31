@@ -108,10 +108,10 @@ mod tests {
 
         assert!(
             ingress
-                .advance_segments(b"\x1b_Ga=q,i=7;", cursor)
+                .advance_segments(b"\x1b_Ga=q,i=7,f=24,s=1,v=1;", cursor)
                 .is_empty()
         );
-        assert!(ingress.advance_segments(b"payload", cursor).is_empty());
+        assert!(ingress.advance_segments(b"AAAA", cursor).is_empty());
         let segments = ingress.advance_segments(b"\x1b\\tail", cursor);
         assert!(
             matches!(&segments[..], [TerminalGraphicsSegment::Event(TerminalGraphicsEvent::Respond(_)), TerminalGraphicsSegment::Terminal(bytes)] if bytes.as_ref() == b"tail")
@@ -150,7 +150,10 @@ mod tests {
             cursor,
         );
 
-        assert_eq!(seen, ["terminal:before", "image", "place", "terminal:after"]);
+        assert_eq!(
+            seen,
+            ["terminal:before", "image", "place", "terminal:after"]
+        );
     }
 
     #[test]
@@ -186,21 +189,16 @@ mod tests {
         let seq = format!("\x1b]1337;File=inline=1:{payload}\x07");
         let first = ingress_advance_chunks(seq.as_bytes());
         assert!(first.terminal_bytes.contains(&b' '));
-        assert!(
-            first
-                .events
-                .iter()
-                .any(|event| {
-                    matches!(
-                        event,
-                        TerminalGraphicsEvent::ImageReady(image)
-                            if image.protocol == TerminalImageProtocol::Iterm2
-                                && image.width == 1
-                                && image.height == 1
-                                && image.rgba.as_ref() == &[255, 0, 0, 255]
-                    )
-                })
-        );
+        assert!(first.events.iter().any(|event| {
+            matches!(
+                event,
+                TerminalGraphicsEvent::ImageReady(image)
+                    if image.protocol == TerminalImageProtocol::Iterm2
+                        && image.width == 1
+                        && image.height == 1
+                        && image.rgba.as_ref() == &[255, 0, 0, 255]
+            )
+        }));
     }
 
     #[test]
@@ -306,13 +304,20 @@ mod tests {
                 })
             )
         }));
-        assert!(!uploaded
-            .events
-            .iter()
-            .any(|event| matches!(event, TerminalGraphicsEvent::Place(_))));
+        assert!(
+            !uploaded
+                .events
+                .iter()
+                .any(|event| matches!(event, TerminalGraphicsEvent::Place(_)))
+        );
 
         let placed = ingress.advance(b"\x1b_Ga=p,i=42,c=3,r=2,z=4\x1b\\", cursor());
-        assert_eq!(placed.terminal_bytes, b"   \r\n   ");
+        assert!(placed.terminal_bytes.is_empty());
+        assert!(
+            placed
+                .events
+                .contains(&TerminalGraphicsEvent::MoveCursor { cols: 3, rows: 2 })
+        );
         assert!(placed.events.iter().any(|event| {
             matches!(
                 event,
@@ -362,7 +367,7 @@ mod tests {
             .expect("animation control update");
         assert!(controlled.animation.running);
         assert!(!controlled.animation.loading);
-        assert_eq!(controlled.animation.loop_limit, Some(2));
+        assert_eq!(controlled.animation.loop_limit, Some(1));
     }
 
     #[test]
@@ -432,12 +437,16 @@ mod tests {
         let payload = BASE64.encode([
             255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
         ]);
-        let seq = format!(
-            "\x1b_Ga=T,f=32,s=2,v=2,i=77,x=1,y=0,w=1,h=2,c=4,r=2,z=-3;{payload}\x1b\\"
-        );
+        let seq =
+            format!("\x1b_Ga=T,f=32,s=2,v=2,i=77,x=1,y=0,w=1,h=2,c=4,r=2,z=-3;{payload}\x1b\\");
         let result = ingress.advance(seq.as_bytes(), cursor());
 
-        assert_eq!(result.terminal_bytes, b"    \r\n    ");
+        assert!(result.terminal_bytes.is_empty());
+        assert!(
+            result
+                .events
+                .contains(&TerminalGraphicsEvent::MoveCursor { cols: 4, rows: 2 })
+        );
         assert!(result.events.iter().any(|event| {
             matches!(
                 event,
@@ -481,7 +490,7 @@ mod tests {
             matches!(
                 event,
                 TerminalGraphicsEvent::ImageReady(TerminalImageData {
-                    id: TerminalImageId(1),
+                    id: TerminalImageId(4294967296),
                     width: 2,
                     height: 2,
                     protocol: TerminalImageProtocol::Kitty,
@@ -493,7 +502,7 @@ mod tests {
             matches!(
                 event,
                 TerminalGraphicsEvent::Place(TerminalImagePlacement {
-                    id: TerminalImageId(1),
+                    id: TerminalImageId(4294967296),
                     row: 0,
                     col: 0,
                     ..
@@ -505,11 +514,20 @@ mod tests {
     #[test]
     fn kitty_yazi_kgp_old_delete_without_payload_clears_all_images() {
         let mut ingress = GraphicsIngress::new(GraphicsOptions::default());
+        ingress.advance(
+            b"\x1b_Ga=T,i=17,f=32,s=1,v=1,C=1,q=2;/wAA/w==\x1b\\",
+            cursor(),
+        );
         let result = ingress.advance(b"\x1b_Gq=2,a=d,d=A\x1b\\", cursor());
 
         assert_eq!(
             result.events,
-            vec![TerminalGraphicsEvent::Delete { id: None }]
+            vec![
+                TerminalGraphicsEvent::DeletePlacement { serial: 1 },
+                TerminalGraphicsEvent::Delete {
+                    id: Some(TerminalImageId(17))
+                }
+            ]
         );
         assert!(result.terminal_bytes.is_empty());
     }
@@ -520,27 +538,22 @@ mod tests {
         let split = payload.len() / 2;
         let mut ingress = GraphicsIngress::new(GraphicsOptions::default());
         let first = format!("\x1b_Ga=T,f=100,i=7,m=1;{}\x1b\\", &payload[..split]);
-        let second = format!("\x1b_Ga=T,f=100,i=7,m=0;{}\x1b\\", &payload[split..]);
+        let second = format!("\x1b_Gm=0;{}\x1b\\", &payload[split..]);
 
         let first = ingress.advance(first.as_bytes(), cursor());
         assert!(first.events.is_empty());
 
         let second = ingress.advance(second.as_bytes(), cursor());
-        assert!(
-            second
-                .events
-                .iter()
-                .any(|event| {
-                    matches!(
-                        event,
-                        TerminalGraphicsEvent::ImageReady(image)
-                            if image.id == TerminalImageId(7)
-                                && image.width == 1
-                                && image.height == 1
-                                && image.rgba.as_ref() == &[255, 0, 0, 255]
-                    )
-                })
-        );
+        assert!(second.events.iter().any(|event| {
+            matches!(
+                event,
+                TerminalGraphicsEvent::ImageReady(image)
+                    if image.id == TerminalImageId(7)
+                        && image.width == 1
+                        && image.height == 1
+                        && image.rgba.as_ref() == &[255, 0, 0, 255]
+            )
+        }));
     }
 
     #[test]
@@ -555,8 +568,7 @@ mod tests {
             let options = GraphicsOptions::default();
             let control = options.kitty_file_transmission.clone();
             let mut ingress = GraphicsIngress::new(options);
-            let sequence =
-                format!("\x1b_Ga=T,t={transmission},f=100,i=12;{payload}\x1b\\");
+            let sequence = format!("\x1b_Ga=T,t={transmission},f=100,i=12;{payload}\x1b\\");
             let result = ingress.advance(sequence.as_bytes(), cursor());
 
             assert!(result.events.iter().any(|event| {
@@ -573,71 +585,73 @@ mod tests {
     }
 
     #[test]
-    fn kitty_file_transmission_is_confined_to_the_approved_session_sandbox() {
+    fn kitty_authorized_files_preserve_pixels_and_clean_only_marked_temporaries() {
         let options = GraphicsOptions::default();
         let control = options.kitty_file_transmission.clone();
-        let sandbox = control.authorize_for_session().unwrap();
-        let bytes = one_pixel_png();
-        let approved_file = sandbox.join("tty-graphics-protocol-图片.png");
-        std::fs::write(&approved_file, &bytes).unwrap();
+        control.authorize_for_session().unwrap();
+        let directory = tempfile::tempdir().unwrap();
         let mut ingress = GraphicsIngress::new(options);
-
-        for transmission in ["f", "t"] {
-            let result = kitty_file_advance(&mut ingress, transmission, &approved_file);
-            assert!(result.events.iter().any(|event| {
-                matches!(
-                    event,
-                    TerminalGraphicsEvent::ImageReady(TerminalImageData {
-                        protocol: TerminalImageProtocol::Kitty,
-                        width: 1,
-                        height: 1,
-                        ..
-                    })
-                )
-            }));
-            // Temporary-mode files remain owned by the sandbox until the
-            // session control is dropped; payload data never chooses deletion.
-            assert!(approved_file.exists());
+        for (mode, name, retained) in [
+            ("f", "图片.png", true),
+            ("t", "ordinary.png", true),
+            ("t", "tty-graphics-protocol-图片.png", false),
+        ] {
+            let path = directory.path().join(name);
+            fs::write(&path, one_pixel_png()).unwrap();
+            let result = kitty_file_advance(&mut ingress, mode, &path);
+            let image = result
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    TerminalGraphicsEvent::ImageReady(image) => Some(image),
+                    _ => None,
+                })
+                .expect("authorized file image");
+            assert_eq!(image.rgba.as_ref(), &[255, 0, 0, 255], "{mode}: {name}");
+            assert_eq!(path.exists(), retained, "{mode}: {name}");
         }
-
-        let outside = tempfile::tempdir().unwrap();
-        let outside_file = outside.path().join("tty-graphics-protocol-outside.png");
-        std::fs::write(&outside_file, &bytes).unwrap();
-        let outside_result = kitty_file_advance(&mut ingress, "t", &outside_file);
-        assert!(outside_result.events.iter().any(|event| {
-            matches!(
-                event,
-                TerminalGraphicsEvent::Error(message)
-                    if message == "Kitty local file transmission path is not allowed"
-            )
-        }));
-        assert!(outside_file.exists());
-
-        let directory = sandbox.join("tty-graphics-protocol-directory");
-        std::fs::create_dir(&directory).unwrap();
-        let directory_result = kitty_file_advance(&mut ingress, "f", &directory);
-        assert!(directory_result.events.iter().any(|event| {
-            matches!(
-                event,
-                TerminalGraphicsEvent::Error(message)
-                    if message == "Kitty local file transmission path is not allowed"
-            )
-        }));
-
-        let debug = format!("{control:?}");
-        assert!(!debug.contains(&sandbox.to_string_lossy().into_owned()));
-        assert!(debug.contains("[redacted session capability]"));
+        let inaccessible = [
+            directory.path().join("missing"),
+            directory.path().to_owned(),
+        ];
+        for path in inaccessible {
+            let result = kitty_file_advance(&mut ingress, "f", &path);
+            assert!(result.events.contains(&TerminalGraphicsEvent::Respond(
+                b"\x1b_Gi=12;EBADF:Failed to read image file\x1b\\".to_vec()
+            )));
+        }
+        ingress.reset_stream();
+        let denied = kitty_file_advance(&mut ingress, "f", &directory.path().join("图片.png"));
+        assert!(denied.events.contains(&TerminalGraphicsEvent::Respond(
+            b"\x1b_Gi=12;EBADF:Failed to read image file\x1b\\".to_vec()
+        )));
+        assert!(control.take_authorization_request());
+        control.deny_for_session();
+        let denied = kitty_file_advance(&mut ingress, "f", &directory.path().join("图片.png"));
+        assert!(denied.events.contains(&TerminalGraphicsEvent::Respond(
+            b"\x1b_Gi=12;EBADF:Failed to read image file\x1b\\".to_vec()
+        )));
+        assert!(!control.take_authorization_request());
+        control.authorize_for_session().unwrap();
+        let granted = kitty_file_advance(&mut ingress, "f", &directory.path().join("图片.png"));
+        assert!(granted.events.contains(&TerminalGraphicsEvent::Respond(
+            b"\x1b_Gi=12;OK\x1b\\".to_vec()
+        )));
+        assert!(!format!("{control:?}").contains(&directory.path().to_string_lossy().into_owned()));
     }
 
     #[cfg(unix)]
     #[test]
-    fn kitty_file_transmission_rejects_unreadable_sandbox_files() {
+    fn kitty_file_transmission_rejects_unreadable_files() {
         use std::os::unix::fs::PermissionsExt;
 
         let options = GraphicsOptions::default();
         let control = options.kitty_file_transmission.clone();
-        let sandbox = control.authorize_for_session().unwrap();
-        let path = sandbox.join("tty-graphics-protocol-unreadable.png");
+        control.authorize_for_session().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("tty-graphics-protocol-unreadable.png");
         std::fs::write(&path, one_pixel_png()).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
 
@@ -692,25 +706,24 @@ mod tests {
         );
         ingress.advance(b"\x1b_Ga=d,d=I,i=42\x1b\\", cursor());
         let missing = ingress.advance(b"\x1b_Ga=p,i=42,C=1\x1b\\", cursor());
-        assert!(matches!(
-            missing.events.as_slice(),
-            [TerminalGraphicsEvent::Error(_)]
-        ));
+        assert!(missing.events.contains(&TerminalGraphicsEvent::Respond(
+            b"\x1b_Gi=42;ENOENT:Image or placement not found\x1b\\".to_vec()
+        )));
     }
 
     #[test]
     fn kitty_delete_and_query_emit_control_events() {
         let mut ingress = GraphicsIngress::new(GraphicsOptions::default());
 
-        let delete = ingress.advance(b"\x1b_Ga=d,i=9;\x1b\\", cursor());
+        let delete = ingress.advance(b"\x1b_Ga=d,d=i,i=9;\x1b\\", cursor());
         assert_eq!(
             delete.events,
-            vec![TerminalGraphicsEvent::DeletePlacements {
-                id: Some(TerminalImageId(9))
-            }]
+            vec![TerminalGraphicsEvent::Respond(
+                b"\x1b_Gi=9;OK\x1b\\".to_vec()
+            )]
         );
 
-        let query = ingress.advance(b"\x1b_Ga=q,i=9;\x1b\\", cursor());
+        let query = ingress.advance(b"\x1b_Ga=q,i=9,f=24,s=1,v=1;AAAA\x1b\\", cursor());
         assert_eq!(
             query.events,
             vec![TerminalGraphicsEvent::Respond(

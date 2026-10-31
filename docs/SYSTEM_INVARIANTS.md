@@ -228,8 +228,11 @@ correctness.
   use short probe deadlines and will otherwise fall back to external preview
   tools.
 - Kitty file/temp-file payloads are base64-encoded UTF-8 paths. Decode the path,
-  enforce storage limits before reading, and delete temp-file payloads after a
-  successful read when the protocol marks them temporary.
+  require explicit session-scoped permission before opening local resources, and
+  enforce storage limits before reading. Delete temporary payloads only after a
+  successful read when the canonical path is in a recognized temporary directory
+  and contains the protocol's temporary-file marker. Apply the same authorization
+  to shared memory; revoke it when the session closes or its transport restarts.
 - Incomplete graphics sequences and Kitty chunk assembly must obey storage
   limits while still incomplete. Do not wait until final decode to enforce
   memory limits.
